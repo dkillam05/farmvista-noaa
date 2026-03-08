@@ -1,5 +1,7 @@
+import gzip
 import math
 import os
+import tempfile
 from datetime import datetime, timedelta, timezone
 
 from flask import Flask, jsonify, request
@@ -7,6 +9,7 @@ from flask import Flask, jsonify, request
 IMPORT_ERROR = None
 try:
     import fsspec
+    import xarray as xr
 except Exception as e:
     IMPORT_ERROR = str(e)
 
@@ -116,25 +119,70 @@ def pick_best_product_and_key(now_utc):
     raise RuntimeError("No usable MRMS hourly QPE file found in NOAA AWS bucket.")
 
 
+def debug_download_and_decode(s3_key):
+    ensure_runtime_ready()
+    fs = get_fs()
+
+    result = {
+        "downloadOk": False,
+        "decompressOk": False,
+        "decodeOk": False,
+        "compressedBytes": None,
+        "decompressedBytes": None,
+        "tempFileExists": False,
+        "tempFileSize": None,
+        "datasetOpened": False,
+        "datasetType": None,
+        "dataVars": None,
+        "coords": None,
+        "dims": None,
+        "decodeError": None,
+    }
+
+    with fs.open(s3_key, "rb") as f:
+        compressed = f.read()
+
+    result["downloadOk"] = True
+    result["compressedBytes"] = len(compressed)
+
+    raw = gzip.decompress(compressed)
+    result["decompressOk"] = True
+    result["decompressedBytes"] = len(raw)
+
+    with tempfile.NamedTemporaryFile(suffix=".grib2", delete=True) as tmp:
+        tmp.write(raw)
+        tmp.flush()
+
+        result["tempFileExists"] = os.path.exists(tmp.name)
+        try:
+            result["tempFileSize"] = os.path.getsize(tmp.name)
+        except Exception:
+            result["tempFileSize"] = None
+
+        try:
+            ds = xr.open_dataset(tmp.name, engine="cfgrib")
+            ds.load()
+            result["datasetOpened"] = True
+            result["decodeOk"] = True
+            result["datasetType"] = str(type(ds))
+            result["dataVars"] = list(ds.data_vars)
+            result["coords"] = list(ds.coords)
+            result["dims"] = {str(k): int(v) for k, v in ds.sizes.items()}
+        except Exception as e:
+            result["decodeError"] = str(e)
+
+    return result
+
+
 @app.get("/")
 def root():
     return jsonify({
         "ok": True,
-        "service": "FarmVista NOAA MRMS metadata test",
+        "service": "FarmVista NOAA MRMS debug service",
         "routes": {
-            "healthz": "/healthz",
             "mrmsTest": "/api/mrms-1h?lat=39.7898&lon=-91.2059&radiusMiles=0.5&mode=weighted",
+            "mrmsDebug": "/api/mrms-debug?lat=39.7898&lon=-91.2059",
         },
-    })
-
-
-@app.get("/healthz")
-def healthz():
-    return jsonify({
-        "ok": True,
-        "pythonReady": IMPORT_ERROR is None,
-        "importError": IMPORT_ERROR,
-        "service": "FarmVista NOAA MRMS metadata test",
     })
 
 
@@ -171,7 +219,43 @@ def api_mrms_1h():
             "selectedKey": s3_key.replace(f"{AWS_BUCKET}/", ""),
             "fileTimestampUtc": file_ts.isoformat() if file_ts else None,
             "checkedProducts": checked,
-            "nextStep": "AWS bucket access is confirmed. Safe base is restored.",
+            "nextStep": "Use /api/mrms-debug to test file download and decode diagnostics.",
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+        }), 500
+
+
+@app.get("/api/mrms-debug")
+def api_mrms_debug():
+    try:
+        lat = num(request.args.get("lat"))
+        lon = num(request.args.get("lon"))
+
+        if lat is None or lon is None:
+            return jsonify({"ok": False, "error": "Missing or invalid lat/lon"}), 400
+
+        now_utc = datetime.now(timezone.utc)
+        product, s3_key, checked = pick_best_product_and_key(now_utc)
+        file_ts = parse_timestamp_from_key(s3_key)
+
+        debug_info = debug_download_and_decode(s3_key)
+
+        return jsonify({
+            "ok": True,
+            "source": "noaa-mrms-aws-debug",
+            "input": {
+                "lat": lat,
+                "lon": lon,
+            },
+            "selectedProduct": product,
+            "selectedKey": s3_key.replace(f"{AWS_BUCKET}/", ""),
+            "fileTimestampUtc": file_ts.isoformat() if file_ts else None,
+            "checkedProducts": checked,
+            "debug": debug_info,
         })
 
     except Exception as e:

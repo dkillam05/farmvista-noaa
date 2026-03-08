@@ -1,5 +1,7 @@
+import gzip
 import math
 import os
+import tempfile
 from datetime import datetime, timedelta, timezone
 
 from flask import Flask, jsonify, request
@@ -7,6 +9,8 @@ from flask import Flask, jsonify, request
 IMPORT_ERROR = None
 try:
     import fsspec
+    import numpy as np
+    import xarray as xr
 except Exception as e:
     IMPORT_ERROR = str(e)
 
@@ -22,6 +26,15 @@ PRODUCT_PRIORITY = [
     "RadarOnly_QPE_01H_00.00",
 ]
 
+SAMPLE_POINTS = [
+    {"key": "center",    "weight": 0.50, "dxMiles":  0.0, "dyMiles":  0.0},
+    {"key": "north",     "weight": 0.10, "dxMiles":  0.0, "dyMiles":  1.0},
+    {"key": "south",     "weight": 0.10, "dxMiles":  0.0, "dyMiles": -1.0},
+    {"key": "east",      "weight": 0.10, "dxMiles":  1.0, "dyMiles":  0.0},
+    {"key": "west",      "weight": 0.10, "dxMiles": -1.0, "dyMiles":  0.0},
+    {"key": "northeast", "weight": 0.10, "dxMiles":  1.0, "dyMiles":  1.0},
+]
+
 
 def num(value):
     try:
@@ -29,6 +42,31 @@ def num(value):
         return n if math.isfinite(n) else None
     except Exception:
         return None
+
+
+def round_num(value, digits=4):
+    if value is None or not math.isfinite(value):
+        return None
+    p = 10 ** digits
+    return round(value * p) / p
+
+
+def miles_to_lat_degrees(miles):
+    return miles / 69.0
+
+
+def miles_to_lon_degrees(miles, lat_deg):
+    cos_lat = math.cos(math.radians(lat_deg))
+    if abs(cos_lat) < 1e-9:
+        return 0.0
+    return miles / (69.172 * cos_lat)
+
+
+def offset_point(lat, lon, east_miles, north_miles):
+    return (
+        lat + miles_to_lat_degrees(north_miles),
+        lon + miles_to_lon_degrees(east_miles, lat),
+    )
 
 
 def ensure_runtime_ready():
@@ -116,14 +154,127 @@ def pick_best_product_and_key(now_utc):
     raise RuntimeError("No usable MRMS hourly QPE file found in NOAA AWS bucket.")
 
 
+def open_dataset_from_s3_key(s3_key):
+    ensure_runtime_ready()
+    fs = get_fs()
+
+    with fs.open(s3_key, "rb") as f:
+        compressed = f.read()
+
+    raw = gzip.decompress(compressed)
+
+    with tempfile.NamedTemporaryFile(suffix=".grib2", delete=True) as tmp:
+        tmp.write(raw)
+        tmp.flush()
+
+        try:
+            ds = xr.open_dataset(tmp.name, engine="cfgrib")
+            ds.load()
+            return ds
+        except Exception as e:
+            raise RuntimeError(
+                "MRMS file was found and downloaded, but GRIB decode failed. "
+                f"Original error: {e}"
+            )
+
+
+def get_data_var(ds):
+    preferred = [
+        "unknown",
+        "tp",
+        "precipitation",
+        "precip",
+        "paramId_0",
+    ]
+
+    for name in preferred:
+        if name in ds.data_vars:
+            return ds[name], name
+
+    data_vars = list(ds.data_vars)
+    if not data_vars:
+        raise RuntimeError("Decoded GRIB dataset has no data variables.")
+    return ds[data_vars[0]], data_vars[0]
+
+
+def normalize_coords(da):
+    rename_map = {}
+
+    for c in list(da.coords):
+        cl = str(c).lower()
+        if cl == "latitude" and c != "latitude":
+            rename_map[c] = "latitude"
+        elif cl == "longitude" and c != "longitude":
+            rename_map[c] = "longitude"
+
+    if rename_map:
+        da = da.rename(rename_map)
+
+    coords = list(da.coords)
+
+    if "latitude" in da.coords and "longitude" in da.coords:
+        return da, "latlon"
+
+    if "lat" in da.coords and "lon" in da.coords:
+        da = da.rename({"lat": "latitude", "lon": "longitude"})
+        return da, "latlon"
+
+    raise RuntimeError(f"Dataset missing usable coordinates. Found coords: {coords}")
+
+
+def sample_nearest_inches(da, lat, lon):
+    da, coord_mode = normalize_coords(da)
+
+    if coord_mode == "latlon":
+        sampled = da.sel(latitude=lat, longitude=lon, method="nearest")
+    else:
+        raise RuntimeError("Unsupported coordinate mode.")
+
+    value = sampled.values
+    if isinstance(value, np.ndarray):
+        value = np.asarray(value).squeeze()
+        if np.size(value) != 1:
+            raise RuntimeError("Unexpected non-scalar sampled value from MRMS dataset.")
+        value = float(value)
+    else:
+        value = float(value)
+
+    if not math.isfinite(value):
+        return 0.0
+
+    if value < 0:
+        return 0.0
+
+    return value
+
+
+def build_weighted_points(lat, lon, radius_miles):
+    pts = []
+    for p in SAMPLE_POINTS:
+        plat, plon = offset_point(
+            lat,
+            lon,
+            p["dxMiles"] * radius_miles,
+            p["dyMiles"] * radius_miles,
+        )
+        pts.append({
+            "key": p["key"],
+            "weight": p["weight"],
+            "lat": plat,
+            "lon": plon,
+        })
+    return pts
+
+
 @app.get("/")
 def root():
     return jsonify({
         "ok": True,
-        "service": "FarmVista NOAA MRMS metadata test",
+        "service": "FarmVista NOAA MRMS rainfall service",
         "routes": {
             "healthz": "/healthz",
-            "mrmsTest": "/api/mrms-1h?lat=39.7898&lon=-91.2059&radiusMiles=0.5&mode=weighted",
+            "single": "/api/mrms-1h?lat=39.7898&lon=-91.2059",
+            "weighted": "/api/mrms-1h?lat=39.7898&lon=-91.2059&radiusMiles=0.5&mode=weighted",
         },
     })
 
@@ -134,7 +285,7 @@ def healthz():
         "ok": True,
         "pythonReady": IMPORT_ERROR is None,
         "importError": IMPORT_ERROR,
-        "service": "FarmVista NOAA MRMS metadata test",
+        "service": "FarmVista NOAA MRMS rainfall service",
     })
 
 
@@ -144,7 +295,7 @@ def api_mrms_1h():
         lat = num(request.args.get("lat"))
         lon = num(request.args.get("lon"))
         radius_miles = num(request.args.get("radiusMiles")) or DEFAULT_RADIUS_MILES
-        mode = (request.args.get("mode") or "weighted").strip().lower()
+        mode = (request.args.get("mode") or "single").strip().lower()
 
         if lat is None or lon is None:
             return jsonify({"ok": False, "error": "Missing or invalid lat/lon"}), 400
@@ -152,26 +303,97 @@ def api_mrms_1h():
             return jsonify({"ok": False, "error": "lat/lon out of range"}), 400
         if radius_miles <= 0:
             return jsonify({"ok": False, "error": "radiusMiles must be > 0"}), 400
+        if mode not in {"single", "weighted"}:
+            return jsonify({"ok": False, "error": "mode must be 'single' or 'weighted'"}), 400
 
         now_utc = datetime.now(timezone.utc)
         product, s3_key, checked = pick_best_product_and_key(now_utc)
         file_ts = parse_timestamp_from_key(s3_key)
 
+        ds = open_dataset_from_s3_key(s3_key)
+        da, variable_name = get_data_var(ds)
+
+        if mode == "single":
+            inches = sample_nearest_inches(da, lat, lon)
+            return jsonify({
+                "ok": True,
+                "source": "noaa-mrms-aws",
+                "mode": "single",
+                "units": "inches",
+                "input": {
+                    "lat": lat,
+                    "lon": lon,
+                },
+                "selectedProduct": product,
+                "selectedKey": s3_key.replace(f"{AWS_BUCKET}/", ""),
+                "fileTimestampUtc": file_ts.isoformat() if file_ts else None,
+                "variableName": variable_name,
+                "hourlyRainInches": round_num(inches, 4),
+                "checkedProducts": checked,
+            })
+
+        pts = build_weighted_points(lat, lon, radius_miles)
+        samples = []
+        good = []
+
+        for p in pts:
+            try:
+                inches = sample_nearest_inches(da, p["lat"], p["lon"])
+                rec = {
+                    "key": p["key"],
+                    "weight": p["weight"],
+                    "lat": round_num(p["lat"], 6),
+                    "lon": round_num(p["lon"], 6),
+                    "inches": round_num(inches, 4),
+                    "ok": True,
+                }
+                good.append(rec)
+            except Exception as e:
+                rec = {
+                    "key": p["key"],
+                    "weight": p["weight"],
+                    "lat": round_num(p["lat"], 6),
+                    "lon": round_num(p["lon"], 6),
+                    "inches": None,
+                    "ok": False,
+                    "error": str(e),
+                }
+            samples.append(rec)
+
+        if not good:
+            return jsonify({
+                "ok": False,
+                "error": "No usable sample points from decoded MRMS dataset.",
+                "selectedProduct": product,
+                "selectedKey": s3_key.replace(f"{AWS_BUCKET}/", ""),
+                "fileTimestampUtc": file_ts.isoformat() if file_ts else None,
+                "variableName": variable_name,
+                "checkedProducts": checked,
+                "samples": samples,
+            }), 502
+
+        used_weight = sum(s["weight"] for s in good)
+        weighted_inches = sum((s["inches"] or 0.0) * s["weight"] for s in good) / used_weight
+
         return jsonify({
             "ok": True,
-            "message": "MRMS AWS listing is working.",
             "source": "noaa-mrms-aws",
+            "mode": "weighted",
+            "units": "inches",
             "input": {
                 "lat": lat,
                 "lon": lon,
                 "radiusMiles": radius_miles,
-                "mode": mode,
             },
             "selectedProduct": product,
             "selectedKey": s3_key.replace(f"{AWS_BUCKET}/", ""),
             "fileTimestampUtc": file_ts.isoformat() if file_ts else None,
+            "variableName": variable_name,
+            "weightedHourlyRainInches": round_num(weighted_inches, 4),
+            "attemptedPointCount": len(samples),
+            "successfulPointCount": len(good),
             "checkedProducts": checked,
-            "nextStep": "AWS bucket access is confirmed. Safe base is restored.",
+            "samples": samples,
         })
 
     except Exception as e:

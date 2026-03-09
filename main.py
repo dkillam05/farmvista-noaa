@@ -2,6 +2,7 @@ import gzip
 import math
 import os
 import tempfile
+import threading
 from datetime import datetime, timedelta, timezone
 
 from flask import Flask, jsonify, request
@@ -19,6 +20,7 @@ app = Flask(__name__)
 AWS_BUCKET = "noaa-mrms-pds"
 DEFAULT_REGION = "CONUS"
 DEFAULT_RADIUS_MILES = 0.5
+MAX_BULK_POINTS = 1000
 
 PRODUCT_PRIORITY = [
     "MultiSensor_QPE_01H_Pass2_00.00",
@@ -34,6 +36,16 @@ SAMPLE_POINTS = [
     {"key": "west",      "weight": 0.10, "dxMiles": -1.0, "dyMiles":  0.0},
     {"key": "northeast", "weight": 0.10, "dxMiles":  1.0, "dyMiles":  1.0},
 ]
+
+CACHE_LOCK = threading.Lock()
+CACHE = {
+    "selectedKey": None,
+    "selectedProduct": None,
+    "fileTimestampUtc": None,
+    "variableName": None,
+    "dataArray": None,
+    "io": None,
+}
 
 
 def num(value):
@@ -167,19 +179,15 @@ def open_dataset_from_s3_key(s3_key):
         tmp.write(raw)
         tmp.flush()
 
-        try:
-            ds = xr.open_dataset(tmp.name, engine="cfgrib")
-            ds.load()
-            return ds, {
-                "compressedBytes": len(compressed),
-                "decompressedBytes": len(raw),
-                "tempFileSize": os.path.getsize(tmp.name),
-            }
-        except Exception as e:
-            raise RuntimeError(
-                "MRMS file was found and downloaded, but GRIB decode failed. "
-                f"Original error: {e}"
-            )
+        ds = xr.open_dataset(tmp.name, engine="cfgrib")
+        ds.load()
+
+        io_info = {
+            "compressedBytes": len(compressed),
+            "decompressedBytes": len(raw),
+            "tempFileSize": os.path.getsize(tmp.name),
+        }
+        return ds, io_info
 
 
 def get_data_var(ds):
@@ -197,7 +205,6 @@ def get_data_var(ds):
 
 def normalize_data_array(da):
     rename_map = {}
-    coords = list(da.coords)
 
     if "latitude" not in da.coords and "lat" in da.coords:
         rename_map["lat"] = "latitude"
@@ -208,9 +215,10 @@ def normalize_data_array(da):
         da = da.rename(rename_map)
 
     if "latitude" not in da.coords or "longitude" not in da.coords:
-        raise RuntimeError(f"Dataset missing usable latitude/longitude coordinates. Found coords: {coords}")
+        raise RuntimeError(
+            f"Dataset missing usable latitude/longitude coordinates. Found coords: {list(da.coords)}"
+        )
 
-    # squeeze singleton dimensions like time/step/heightAboveSea
     for dim in list(da.dims):
         if dim not in ("latitude", "longitude") and da.sizes.get(dim, 0) == 1:
             da = da.isel({dim: 0})
@@ -218,8 +226,48 @@ def normalize_data_array(da):
     return da
 
 
+def get_cached_dataset():
+    now_utc = datetime.now(timezone.utc)
+    product, s3_key, checked = pick_best_product_and_key(now_utc)
+    file_ts = parse_timestamp_from_key(s3_key)
+
+    with CACHE_LOCK:
+        if CACHE["selectedKey"] == s3_key and CACHE["dataArray"] is not None:
+            return {
+                "selectedProduct": CACHE["selectedProduct"],
+                "selectedKey": CACHE["selectedKey"],
+                "fileTimestampUtc": CACHE["fileTimestampUtc"],
+                "variableName": CACHE["variableName"],
+                "dataArray": CACHE["dataArray"],
+                "io": CACHE["io"],
+                "cacheHit": True,
+                "checkedProducts": checked,
+            }
+
+        ds, io_info = open_dataset_from_s3_key(s3_key)
+        da, variable_name = get_data_var(ds)
+        da = normalize_data_array(da)
+
+        CACHE["selectedKey"] = s3_key
+        CACHE["selectedProduct"] = product
+        CACHE["fileTimestampUtc"] = file_ts.isoformat() if file_ts else None
+        CACHE["variableName"] = variable_name
+        CACHE["dataArray"] = da
+        CACHE["io"] = io_info
+
+        return {
+            "selectedProduct": product,
+            "selectedKey": s3_key,
+            "fileTimestampUtc": file_ts.isoformat() if file_ts else None,
+            "variableName": variable_name,
+            "dataArray": da,
+            "io": io_info,
+            "cacheHit": False,
+            "checkedProducts": checked,
+        }
+
+
 def sample_nearest_inches(da, lat, lon):
-    da = normalize_data_array(da)
     sampled = da.sel(latitude=lat, longitude=lon, method="nearest")
 
     value = sampled.values
@@ -233,11 +281,35 @@ def sample_nearest_inches(da, lat, lon):
 
     if not math.isfinite(value):
         return 0.0
-
     if value < 0:
         return 0.0
 
     return value
+
+
+def sample_nearest_with_grid(da, lat, lon):
+    sampled = da.sel(latitude=lat, longitude=lon, method="nearest")
+
+    value = sampled.values
+    if isinstance(value, np.ndarray):
+        value = np.asarray(value).squeeze()
+        if np.size(value) != 1:
+            raise RuntimeError("Unexpected non-scalar sampled value from MRMS dataset.")
+        value = float(value)
+    else:
+        value = float(value)
+
+    grid_lat = float(sampled["latitude"].values)
+    grid_lon = float(sampled["longitude"].values)
+
+    if not math.isfinite(value) or value < 0:
+        value = 0.0
+
+    return {
+        "inches": value,
+        "nearestGridLatitude": grid_lat,
+        "nearestGridLongitude": grid_lon,
+    }
 
 
 def build_weighted_points(lat, lon, radius_miles):
@@ -258,61 +330,88 @@ def build_weighted_points(lat, lon, radius_miles):
     return pts
 
 
+def parse_bulk_points_from_query(points_str):
+    points = []
+    if not points_str:
+        return points
+
+    chunks = [x.strip() for x in points_str.split(";") if x.strip()]
+    for idx, chunk in enumerate(chunks):
+        parts = [p.strip() for p in chunk.split(",")]
+        if len(parts) != 2:
+            raise RuntimeError(f"Invalid points format at item {idx + 1}. Use lat,lon;lat,lon")
+        lat = num(parts[0])
+        lon = num(parts[1])
+        if lat is None or lon is None:
+            raise RuntimeError(f"Invalid numeric lat/lon at item {idx + 1}")
+        points.append({"lat": lat, "lon": lon})
+    return points
+
+
+def validate_point(lat, lon):
+    if lat is None or lon is None:
+        raise RuntimeError("Missing or invalid lat/lon")
+    if lat < -90 or lat > 90 or lon < -180 or lon > 180:
+        raise RuntimeError("lat/lon out of range")
+
+
+def build_single_result(da, lat, lon):
+    sampled = sample_nearest_with_grid(da, lat, lon)
+    return {
+        "lat": round_num(lat, 6),
+        "lon": round_num(lon, 6),
+        "hourlyRainInches": round_num(sampled["inches"], 4),
+        "nearestGridLatitude": round_num(sampled["nearestGridLatitude"], 6),
+        "nearestGridLongitude": round_num(sampled["nearestGridLongitude"], 6),
+    }
+
+
+def build_weighted_result(da, lat, lon, radius_miles):
+    pts = build_weighted_points(lat, lon, radius_miles)
+    samples = []
+    good = []
+
+    for p in pts:
+        sampled = sample_nearest_with_grid(da, p["lat"], p["lon"])
+        rec = {
+            "key": p["key"],
+            "weight": p["weight"],
+            "lat": round_num(p["lat"], 6),
+            "lon": round_num(p["lon"], 6),
+            "inches": round_num(sampled["inches"], 4),
+            "nearestGridLatitude": round_num(sampled["nearestGridLatitude"], 6),
+            "nearestGridLongitude": round_num(sampled["nearestGridLongitude"], 6),
+            "ok": True,
+        }
+        samples.append(rec)
+        good.append(rec)
+
+    used_weight = sum(s["weight"] for s in good)
+    weighted_inches = sum((s["inches"] or 0.0) * s["weight"] for s in good) / used_weight
+
+    return {
+        "lat": round_num(lat, 6),
+        "lon": round_num(lon, 6),
+        "radiusMiles": radius_miles,
+        "weightedHourlyRainInches": round_num(weighted_inches, 4),
+        "attemptedPointCount": len(samples),
+        "successfulPointCount": len(good),
+        "samples": samples,
+    }
+
+
 @app.get("/")
 def root():
     return jsonify({
         "ok": True,
-        "service": "FarmVista NOAA MRMS rainfall service",
+        "service": "FarmVista NOAA MRMS rainfall bulk service",
         "routes": {
             "single": "/api/mrms-1h?lat=39.7898&lon=-91.2059",
             "weighted": "/api/mrms-1h?lat=39.7898&lon=-91.2059&radiusMiles=0.5&mode=weighted",
-            "debug": "/api/mrms-debug?lat=39.7898&lon=-91.2059",
+            "bulkGet": "/api/mrms-bulk?points=39.7898,-91.2059;39.8,-91.19&mode=weighted&radiusMiles=0.5",
+            "bulkPost": "POST /api/mrms-bulk  JSON: {\"points\":[{\"lat\":39.78,\"lon\":-91.20}],\"mode\":\"weighted\",\"radiusMiles\":0.5}",
         },
     })
-
-
-@app.get("/api/mrms-debug")
-def api_mrms_debug():
-    try:
-        lat = num(request.args.get("lat"))
-        lon = num(request.args.get("lon"))
-
-        if lat is None or lon is None:
-            return jsonify({"ok": False, "error": "Missing or invalid lat/lon"}), 400
-
-        now_utc = datetime.now(timezone.utc)
-        product, s3_key, checked = pick_best_product_and_key(now_utc)
-        file_ts = parse_timestamp_from_key(s3_key)
-
-        ds, io_info = open_dataset_from_s3_key(s3_key)
-        da, variable_name = get_data_var(ds)
-        da = normalize_data_array(da)
-
-        return jsonify({
-            "ok": True,
-            "source": "noaa-mrms-aws-debug",
-            "input": {
-                "lat": lat,
-                "lon": lon,
-            },
-            "selectedProduct": product,
-            "selectedKey": s3_key.replace(f"{AWS_BUCKET}/", ""),
-            "fileTimestampUtc": file_ts.isoformat() if file_ts else None,
-            "checkedProducts": checked,
-            "debug": {
-                **io_info,
-                "dataVars": list(ds.data_vars),
-                "coords": list(ds.coords),
-                "dims": {str(k): int(v) for k, v in da.sizes.items()},
-                "variableName": variable_name,
-            },
-        })
-
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e),
-        }), 500
 
 
 @app.get("/api/mrms-1h")
@@ -323,106 +422,164 @@ def api_mrms_1h():
         radius_miles = num(request.args.get("radiusMiles")) or DEFAULT_RADIUS_MILES
         mode = (request.args.get("mode") or "single").strip().lower()
 
-        if lat is None or lon is None:
-            return jsonify({"ok": False, "error": "Missing or invalid lat/lon"}), 400
-        if lat < -90 or lat > 90 or lon < -180 or lon > 180:
-            return jsonify({"ok": False, "error": "lat/lon out of range"}), 400
+        validate_point(lat, lon)
+
         if radius_miles <= 0:
             return jsonify({"ok": False, "error": "radiusMiles must be > 0"}), 400
         if mode not in {"single", "weighted"}:
             return jsonify({"ok": False, "error": "mode must be 'single' or 'weighted'"}), 400
 
-        now_utc = datetime.now(timezone.utc)
-        product, s3_key, checked = pick_best_product_and_key(now_utc)
-        file_ts = parse_timestamp_from_key(s3_key)
-
-        ds, io_info = open_dataset_from_s3_key(s3_key)
-        da, variable_name = get_data_var(ds)
+        meta = get_cached_dataset()
+        da = meta["dataArray"]
 
         if mode == "single":
-            inches = sample_nearest_inches(da, lat, lon)
-
-            return jsonify({
-                "ok": True,
-                "source": "noaa-mrms-aws",
-                "mode": "single",
-                "units": "inches",
-                "input": {
-                    "lat": lat,
-                    "lon": lon,
-                },
-                "selectedProduct": product,
-                "selectedKey": s3_key.replace(f"{AWS_BUCKET}/", ""),
-                "fileTimestampUtc": file_ts.isoformat() if file_ts else None,
-                "variableName": variable_name,
-                "hourlyRainInches": round_num(inches, 4),
-                "checkedProducts": checked,
-                "io": io_info,
-            })
-
-        pts = build_weighted_points(lat, lon, radius_miles)
-        samples = []
-        good = []
-
-        for p in pts:
-            try:
-                inches = sample_nearest_inches(da, p["lat"], p["lon"])
-                rec = {
-                    "key": p["key"],
-                    "weight": p["weight"],
-                    "lat": round_num(p["lat"], 6),
-                    "lon": round_num(p["lon"], 6),
-                    "inches": round_num(inches, 4),
-                    "ok": True,
-                }
-                good.append(rec)
-            except Exception as e:
-                rec = {
-                    "key": p["key"],
-                    "weight": p["weight"],
-                    "lat": round_num(p["lat"], 6),
-                    "lon": round_num(p["lon"], 6),
-                    "inches": None,
-                    "ok": False,
-                    "error": str(e),
-                }
-            samples.append(rec)
-
-        if not good:
-            return jsonify({
-                "ok": False,
-                "error": "No usable sample points from decoded MRMS dataset.",
-                "selectedProduct": product,
-                "selectedKey": s3_key.replace(f"{AWS_BUCKET}/", ""),
-                "fileTimestampUtc": file_ts.isoformat() if file_ts else None,
-                "variableName": variable_name,
-                "checkedProducts": checked,
-                "samples": samples,
-            }), 502
-
-        used_weight = sum(s["weight"] for s in good)
-        weighted_inches = sum((s["inches"] or 0.0) * s["weight"] for s in good) / used_weight
+            result = build_single_result(da, lat, lon)
+        else:
+            result = build_weighted_result(da, lat, lon, radius_miles)
 
         return jsonify({
             "ok": True,
             "source": "noaa-mrms-aws",
-            "mode": "weighted",
+            "mode": mode,
             "units": "inches",
-            "input": {
-                "lat": lat,
-                "lon": lon,
-                "radiusMiles": radius_miles,
-            },
-            "selectedProduct": product,
-            "selectedKey": s3_key.replace(f"{AWS_BUCKET}/", ""),
-            "fileTimestampUtc": file_ts.isoformat() if file_ts else None,
-            "variableName": variable_name,
-            "weightedHourlyRainInches": round_num(weighted_inches, 4),
-            "attemptedPointCount": len(samples),
-            "successfulPointCount": len(good),
-            "checkedProducts": checked,
-            "samples": samples,
-            "io": io_info,
+            "selectedProduct": meta["selectedProduct"],
+            "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
+            "fileTimestampUtc": meta["fileTimestampUtc"],
+            "variableName": meta["variableName"],
+            "cacheHit": meta["cacheHit"],
+            "checkedProducts": meta["checkedProducts"],
+            "io": meta["io"],
+            "result": result,
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+        }), 500
+
+
+@app.get("/api/mrms-bulk")
+def api_mrms_bulk_get():
+    try:
+        points_str = request.args.get("points", "")
+        mode = (request.args.get("mode") or "single").strip().lower()
+        radius_miles = num(request.args.get("radiusMiles")) or DEFAULT_RADIUS_MILES
+
+        points = parse_bulk_points_from_query(points_str)
+        if not points:
+            return jsonify({"ok": False, "error": "No points provided"}), 400
+        if len(points) > MAX_BULK_POINTS:
+            return jsonify({"ok": False, "error": f"Too many points. Max {MAX_BULK_POINTS}"}), 400
+        if mode not in {"single", "weighted"}:
+            return jsonify({"ok": False, "error": "mode must be 'single' or 'weighted'"}), 400
+        if radius_miles <= 0:
+            return jsonify({"ok": False, "error": "radiusMiles must be > 0"}), 400
+
+        meta = get_cached_dataset()
+        da = meta["dataArray"]
+
+        results = []
+        total_grid_samples = 0
+
+        for idx, p in enumerate(points):
+            validate_point(p["lat"], p["lon"])
+            if mode == "single":
+                result = build_single_result(da, p["lat"], p["lon"])
+                total_grid_samples += 1
+            else:
+                result = build_weighted_result(da, p["lat"], p["lon"], radius_miles)
+                total_grid_samples += 6
+
+            results.append({
+                "index": idx,
+                **result,
+            })
+
+        return jsonify({
+            "ok": True,
+            "source": "noaa-mrms-aws",
+            "mode": mode,
+            "units": "inches",
+            "selectedProduct": meta["selectedProduct"],
+            "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
+            "fileTimestampUtc": meta["fileTimestampUtc"],
+            "variableName": meta["variableName"],
+            "cacheHit": meta["cacheHit"],
+            "checkedProducts": meta["checkedProducts"],
+            "io": meta["io"],
+            "pointCount": len(points),
+            "totalGridSamples": total_grid_samples,
+            "results": results,
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+        }), 500
+
+
+@app.post("/api/mrms-bulk")
+def api_mrms_bulk_post():
+    try:
+        body = request.get_json(silent=True) or {}
+        points = body.get("points") or []
+        mode = str(body.get("mode") or "single").strip().lower()
+        radius_miles = num(body.get("radiusMiles")) or DEFAULT_RADIUS_MILES
+
+        if not isinstance(points, list) or not points:
+            return jsonify({"ok": False, "error": "JSON body must include points array"}), 400
+        if len(points) > MAX_BULK_POINTS:
+            return jsonify({"ok": False, "error": f"Too many points. Max {MAX_BULK_POINTS}"}), 400
+        if mode not in {"single", "weighted"}:
+            return jsonify({"ok": False, "error": "mode must be 'single' or 'weighted'"}), 400
+        if radius_miles <= 0:
+            return jsonify({"ok": False, "error": "radiusMiles must be > 0"}), 400
+
+        cleaned_points = []
+        for idx, p in enumerate(points):
+            if not isinstance(p, dict):
+                return jsonify({"ok": False, "error": f"Point {idx} must be an object"}), 400
+            lat = num(p.get("lat"))
+            lon = num(p.get("lon"))
+            validate_point(lat, lon)
+            cleaned_points.append({"lat": lat, "lon": lon})
+
+        meta = get_cached_dataset()
+        da = meta["dataArray"]
+
+        results = []
+        total_grid_samples = 0
+
+        for idx, p in enumerate(cleaned_points):
+            if mode == "single":
+                result = build_single_result(da, p["lat"], p["lon"])
+                total_grid_samples += 1
+            else:
+                result = build_weighted_result(da, p["lat"], p["lon"], radius_miles)
+                total_grid_samples += 6
+
+            results.append({
+                "index": idx,
+                **result,
+            })
+
+        return jsonify({
+            "ok": True,
+            "source": "noaa-mrms-aws",
+            "mode": mode,
+            "units": "inches",
+            "selectedProduct": meta["selectedProduct"],
+            "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
+            "fileTimestampUtc": meta["fileTimestampUtc"],
+            "variableName": meta["variableName"],
+            "cacheHit": meta["cacheHit"],
+            "checkedProducts": meta["checkedProducts"],
+            "io": meta["io"],
+            "pointCount": len(cleaned_points),
+            "totalGridSamples": total_grid_samples,
+            "results": results,
         })
 
     except Exception as e:

@@ -5,3 +5,4 @@ s3fs==2025.2.0
 xarray==2025.1.2
 cfgrib==0.9.15.0
 numpy==2.2.3
+firebase-admin==6.5.0

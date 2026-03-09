@@ -4,6 +4,7 @@ import os
 import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 from flask import Flask, jsonify, request
 
@@ -13,7 +14,7 @@ try:
     import numpy as np
     import xarray as xr
     import firebase_admin
-    from firebase_admin import credentials, firestore
+    from firebase_admin import firestore
 except Exception as e:
     IMPORT_ERROR = str(e)
 
@@ -26,8 +27,13 @@ MAX_BULK_POINTS = 1000
 
 WEATHER_CACHE_COLLECTION = os.environ.get("FV_WEATHER_CACHE_COLLECTION", "field_weather_cache")
 FIELDS_COLLECTION = os.environ.get("FV_FIELDS_COLLECTION", "fields")
+MRMS_HOURLY_SUBCOLLECTION = os.environ.get("FV_MRMS_HOURLY_SUBCOLLECTION", "mrms_hourly")
+APP_TIMEZONE = os.environ.get("FV_TIMEZONE", "America/Chicago")
 
-# Prefer Pass 2, then fall back to Pass 1
+KEEP_DAYS = 30
+KEEP_HOURS = KEEP_DAYS * 24
+LAST24_COUNT = 24
+
 PRODUCT_PRIORITY = [
     "MultiSensor_QPE_01H_Pass2_00.00",
     "MultiSensor_QPE_01H_Pass1_00.00",
@@ -122,6 +128,13 @@ def get_db():
     return _DB
 
 
+def get_app_tz():
+    try:
+        return ZoneInfo(APP_TIMEZONE)
+    except Exception:
+        return timezone.utc
+
+
 def list_candidate_dates(now_utc, days_back=2):
     out = []
     for i in range(days_back + 1):
@@ -136,6 +149,17 @@ def parse_timestamp_from_key(key):
         return datetime.strptime(stamp, "%Y%m%d-%H%M%S").replace(tzinfo=timezone.utc)
     except Exception:
         return None
+
+
+def iso_utc(dt):
+    return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def hour_doc_id_from_iso(file_timestamp_utc):
+    return (
+        file_timestamp_utc.replace("-", "")
+        .replace(":", "")
+    )
 
 
 def list_latest_key(region, product, now_utc, max_age_hours=12):
@@ -178,6 +202,23 @@ def list_latest_key(region, product, now_utc, max_age_hours=12):
     return pool[-1][1]
 
 
+def list_key_for_exact_hour(region, product, target_dt_utc):
+    fs = get_fs()
+    ymd = target_dt_utc.strftime("%Y%m%d")
+    stamp = target_dt_utc.strftime("%Y%m%d-%H0000")
+    prefix = f"{AWS_BUCKET}/{region}/{product}/{ymd}/"
+
+    try:
+        keys = fs.ls(prefix, detail=False)
+    except Exception:
+        return None
+
+    for k in keys:
+        if k.endswith(f"_{stamp}.grib2.gz"):
+            return k
+    return None
+
+
 def pick_best_available_key(now_utc):
     checked = []
 
@@ -192,6 +233,22 @@ def pick_best_available_key(now_utc):
             return product, key, checked
 
     raise RuntimeError("No usable MRMS Pass2 or Pass1 hourly QPE file found in NOAA AWS bucket.")
+
+
+def pick_best_key_for_hour(target_dt_utc):
+    checked = []
+
+    for product in PRODUCT_PRIORITY:
+        key = list_key_for_exact_hour(DEFAULT_REGION, product, target_dt_utc)
+        checked.append({
+            "product": product,
+            "found": bool(key),
+            "key": key.replace(f"{AWS_BUCKET}/", "") if key else None,
+        })
+        if key:
+            return product, key, checked
+
+    return None, None, checked
 
 
 def open_dataset_from_s3_key(s3_key):
@@ -299,7 +356,7 @@ def get_cached_dataset():
 
         CACHE["selectedKey"] = s3_key
         CACHE["selectedProduct"] = product
-        CACHE["fileTimestampUtc"] = file_ts.isoformat() if file_ts else None
+        CACHE["fileTimestampUtc"] = iso_utc(file_ts) if file_ts else None
         CACHE["variableName"] = variable_name
         CACHE["dataArray"] = da
         CACHE["io"] = io_info
@@ -307,13 +364,29 @@ def get_cached_dataset():
         return {
             "selectedProduct": product,
             "selectedKey": s3_key,
-            "fileTimestampUtc": file_ts.isoformat() if file_ts else None,
+            "fileTimestampUtc": iso_utc(file_ts) if file_ts else None,
             "variableName": variable_name,
             "dataArray": da,
             "io": io_info,
             "cacheHit": False,
             "checkedProducts": checked,
         }
+
+
+def get_dataset_for_key_uncached(product, s3_key):
+    file_ts = parse_timestamp_from_key(s3_key)
+    ds, io_info = open_dataset_from_s3_key(s3_key)
+    da, variable_name = get_data_var(ds)
+    da = normalize_data_array(da)
+    return {
+        "selectedProduct": product,
+        "selectedKey": s3_key,
+        "fileTimestampUtc": iso_utc(file_ts) if file_ts else None,
+        "variableName": variable_name,
+        "dataArray": da,
+        "io": io_info,
+        "cacheHit": False,
+    }
 
 
 def sample_nearest_with_grid(da, lat, lon):
@@ -487,7 +560,91 @@ def load_active_fields_for_batch():
     return out
 
 
-def build_firestore_payload(field, meta, mode, radius_miles, result):
+def get_field_by_id(field_id):
+    db = get_db()
+    doc = db.collection(FIELDS_COLLECTION).document(field_id).get()
+    if not doc.exists:
+        return None
+
+    d = doc.to_dict() or {}
+    loc = d.get("location") or {}
+    lat = num(loc.get("lat"))
+    lng = num(loc.get("lng"))
+    if lat is None or lng is None:
+        raise RuntimeError("Field exists but location.lat/lng is missing or invalid")
+
+    return {
+        "id": doc.id,
+        "name": str(d.get("name") or ""),
+        "farmId": d.get("farmId"),
+        "farmName": d.get("farmName"),
+        "lat": lat,
+        "lng": lng,
+    }
+
+
+def extract_rain_value(mode, result):
+    if mode == "single":
+        return result["hourlyRainInches"]
+    return result["weightedHourlyRainInches"]
+
+
+def build_hour_history_entry(meta, mode, radius_miles, result):
+    entry = {
+        "source": "noaa-mrms-aws",
+        "selectedProduct": meta["selectedProduct"],
+        "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
+        "fileTimestampUtc": meta["fileTimestampUtc"],
+        "variableName": meta["variableName"],
+        "mode": mode,
+        "radiusMiles": radius_miles if mode == "weighted" else None,
+        "rainInches": extract_rain_value(mode, result),
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }
+
+    if mode == "single":
+        entry["nearestGridLatitude"] = result["nearestGridLatitude"]
+        entry["nearestGridLongitude"] = result["nearestGridLongitude"]
+        entry["nearestGridLongitudeRaw"] = result["nearestGridLongitudeRaw"]
+        entry["queryLongitudeUsed"] = result["queryLongitudeUsed"]
+        entry["longitudeMode"] = result["longitudeMode"]
+    else:
+        entry["attemptedPointCount"] = result["attemptedPointCount"]
+        entry["successfulPointCount"] = result["successfulPointCount"]
+        entry["samples"] = result["samples"]
+
+    return entry
+
+
+def build_latest_payload(field, meta, mode, radius_miles, result, last24, daily30):
+    latest = {
+        "source": "noaa-mrms-aws",
+        "selectedProduct": meta["selectedProduct"],
+        "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
+        "fileTimestampUtc": meta["fileTimestampUtc"],
+        "variableName": meta["variableName"],
+        "mode": mode,
+        "radiusMiles": radius_miles if mode == "weighted" else None,
+        "cacheHit": meta["cacheHit"],
+        "io": meta["io"],
+        "checkedProducts": meta.get("checkedProducts"),
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+        "rainInches": extract_rain_value(mode, result),
+    }
+
+    if mode == "single":
+        latest["hourlyRainInches"] = result["hourlyRainInches"]
+        latest["nearestGridLatitude"] = result["nearestGridLatitude"]
+        latest["nearestGridLongitude"] = result["nearestGridLongitude"]
+        latest["nearestGridLongitudeRaw"] = result["nearestGridLongitudeRaw"]
+        latest["queryLongitudeUsed"] = result["queryLongitudeUsed"]
+        latest["longitudeMode"] = result["longitudeMode"]
+    else:
+        latest["weightedHourlyRainInches"] = result["weightedHourlyRainInches"]
+        latest["attemptedPointCount"] = result["attemptedPointCount"]
+        latest["successfulPointCount"] = result["successfulPointCount"]
+        latest["samples"] = result["samples"]
+
     payload = {
         "fieldId": field["id"],
         "fieldName": field.get("name") or None,
@@ -497,36 +654,119 @@ def build_firestore_payload(field, meta, mode, radius_miles, result):
             "lat": field["lat"],
             "lng": field["lng"],
         },
-        "mrmsHourlyLatest": {
-            "source": "noaa-mrms-aws",
-            "selectedProduct": meta["selectedProduct"],
-            "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
-            "fileTimestampUtc": meta["fileTimestampUtc"],
-            "variableName": meta["variableName"],
-            "mode": mode,
-            "radiusMiles": radius_miles if mode == "weighted" else None,
-            "cacheHit": meta["cacheHit"],
-            "io": meta["io"],
-            "checkedProducts": meta["checkedProducts"],
-            "updatedAt": firestore.SERVER_TIMESTAMP,
+        "mrmsHourlyLatest": latest,
+        "mrmsHourlyLast24": last24,
+        "mrmsDailySeries30d": daily30,
+        "mrmsHistoryMeta": {
+            "subcollection": MRMS_HOURLY_SUBCOLLECTION,
+            "keepDays": KEEP_DAYS,
+            "keepHours": KEEP_HOURS,
+            "latestFileTimestampUtc": meta["fileTimestampUtc"],
+            "latestSelectedProduct": meta["selectedProduct"],
+            "last24Count": len(last24),
+            "daily30Count": len(daily30),
         },
         "mrmsLastUpdatedAt": firestore.SERVER_TIMESTAMP,
     }
 
-    if mode == "single":
-        payload["mrmsHourlyLatest"]["hourlyRainInches"] = result["hourlyRainInches"]
-        payload["mrmsHourlyLatest"]["nearestGridLatitude"] = result["nearestGridLatitude"]
-        payload["mrmsHourlyLatest"]["nearestGridLongitude"] = result["nearestGridLongitude"]
-        payload["mrmsHourlyLatest"]["nearestGridLongitudeRaw"] = result["nearestGridLongitudeRaw"]
-        payload["mrmsHourlyLatest"]["queryLongitudeUsed"] = result["queryLongitudeUsed"]
-        payload["mrmsHourlyLatest"]["longitudeMode"] = result["longitudeMode"]
-    else:
-        payload["mrmsHourlyLatest"]["weightedHourlyRainInches"] = result["weightedHourlyRainInches"]
-        payload["mrmsHourlyLatest"]["attemptedPointCount"] = result["attemptedPointCount"]
-        payload["mrmsHourlyLatest"]["successfulPointCount"] = result["successfulPointCount"]
-        payload["mrmsHourlyLatest"]["samples"] = result["samples"]
-
     return payload
+
+
+def rebuild_last24_and_daily30(field_id):
+    db = get_db()
+    tz = get_app_tz()
+
+    parent_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field_id)
+    hourly_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
+
+    cutoff_dt = datetime.now(timezone.utc) - timedelta(days=KEEP_DAYS)
+    cutoff_iso = iso_utc(cutoff_dt)
+
+    old_docs = list(hourly_ref.where("fileTimestampUtc", "<", cutoff_iso).stream())
+    if old_docs:
+        b = db.batch()
+        count = 0
+        for doc in old_docs:
+            b.delete(doc.reference)
+            count += 1
+            if count >= 400:
+                b.commit()
+                b = db.batch()
+                count = 0
+        if count > 0:
+            b.commit()
+
+    docs = list(hourly_ref.where("fileTimestampUtc", ">=", cutoff_iso).stream())
+    rows = []
+    for doc in docs:
+        d = doc.to_dict() or {}
+        ts = str(d.get("fileTimestampUtc") or "")
+        rain = num(d.get("rainInches"))
+        if not ts or rain is None:
+            continue
+        rows.append({
+            "hourKey": doc.id,
+            "fileTimestampUtc": ts,
+            "rainInches": round_num(rain, 4),
+            "selectedProduct": d.get("selectedProduct"),
+            "mode": d.get("mode"),
+            "source": d.get("source"),
+        })
+
+    rows.sort(key=lambda x: x["fileTimestampUtc"], reverse=True)
+    last24 = rows[:LAST24_COUNT]
+
+    daily_map = {}
+    for row in rows:
+        try:
+            dt = datetime.fromisoformat(row["fileTimestampUtc"].replace("Z", "+00:00"))
+            local_date = dt.astimezone(tz).date().isoformat()
+        except Exception:
+            continue
+
+        bucket = daily_map.get(local_date)
+        if bucket is None:
+            bucket = {
+                "dateISO": local_date,
+                "rainIn": 0.0,
+                "hoursCount": 0,
+            }
+            daily_map[local_date] = bucket
+
+        bucket["rainIn"] += float(row["rainInches"] or 0.0)
+        bucket["hoursCount"] += 1
+
+    daily30 = []
+    for date_iso in sorted(daily_map.keys()):
+        d = daily_map[date_iso]
+        daily30.append({
+            "dateISO": d["dateISO"],
+            "rainIn": round_num(d["rainIn"], 4),
+            "hoursCount": d["hoursCount"],
+        })
+
+    daily30 = daily30[-KEEP_DAYS:]
+
+    return last24, daily30
+
+
+def write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, result):
+    history_entry = build_hour_history_entry(meta, mode, radius_miles, result)
+    hour_ref.set(history_entry, merge=True)
+
+    last24, daily30 = rebuild_last24_and_daily30(field["id"])
+
+    parent_payload = build_latest_payload(
+        field=field,
+        meta=meta,
+        mode=mode,
+        radius_miles=radius_miles,
+        result=result,
+        last24=last24,
+        daily30=daily30,
+    )
+
+    parent_ref.set(parent_payload, merge=True)
 
 
 def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
@@ -542,8 +782,6 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
     meta = get_cached_dataset()
     da = meta["dataArray"]
 
-    batch = db.batch()
-    writes = 0
     ok = 0
     fail = 0
     failures = []
@@ -555,17 +793,12 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
             else:
                 result = build_weighted_result(da, field["lat"], field["lng"], radius_miles)
 
-            doc_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field["id"])
-            payload = build_firestore_payload(field, meta, mode, radius_miles, result)
+            parent_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field["id"])
+            hour_id = hour_doc_id_from_iso(meta["fileTimestampUtc"])
+            hour_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION).document(hour_id)
 
-            batch.set(doc_ref, payload, merge=True)
-            writes += 1
+            write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, result)
             ok += 1
-
-            if writes >= 400:
-                batch.commit()
-                batch = db.batch()
-                writes = 0
 
         except Exception as e:
             fail += 1
@@ -574,9 +807,6 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
                 "fieldName": field.get("name"),
                 "error": str(e),
             })
-
-    if writes > 0:
-        batch.commit()
 
     return {
         "total": total,
@@ -591,6 +821,119 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
     }
 
 
+def backfill_field(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
+    db = get_db()
+
+    field = get_field_by_id(field_id)
+    if not field:
+        raise RuntimeError("Field not found")
+
+    days = int(clamp(days, 1, 30))
+    if mode not in {"single", "weighted"}:
+        raise RuntimeError("mode must be 'single' or 'weighted'")
+    if radius_miles <= 0:
+        raise RuntimeError("radiusMiles must be > 0")
+
+    now_utc = datetime.now(timezone.utc)
+    this_hour = now_utc.replace(minute=0, second=0, microsecond=0)
+    total_hours = days * 24
+
+    parent_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field["id"])
+
+    ok = 0
+    skipped = 0
+    fail = 0
+    failures = []
+
+    for i in range(total_hours):
+        target_dt = this_hour - timedelta(hours=i)
+        product, s3_key, checked = pick_best_key_for_hour(target_dt)
+
+        if not s3_key:
+            skipped += 1
+            continue
+
+        try:
+            meta = get_dataset_for_key_uncached(product, s3_key)
+            meta["checkedProducts"] = checked
+
+            da = meta["dataArray"]
+            if mode == "single":
+                result = build_single_result(da, field["lat"], field["lng"])
+            else:
+                result = build_weighted_result(da, field["lat"], field["lng"], radius_miles)
+
+            hour_id = hour_doc_id_from_iso(meta["fileTimestampUtc"])
+            hour_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION).document(hour_id)
+
+            history_entry = build_hour_history_entry(meta, mode, radius_miles, result)
+            hour_ref.set(history_entry, merge=True)
+            ok += 1
+
+        except Exception as e:
+            fail += 1
+            failures.append({
+                "targetHourUtc": iso_utc(target_dt),
+                "error": str(e),
+            })
+
+    latest_docs = list(
+        parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
+        .order_by("fileTimestampUtc", direction=firestore.Query.DESCENDING)
+        .limit(1)
+        .stream()
+    )
+
+    if latest_docs:
+        latest_doc = latest_docs[0].to_dict() or {}
+        latest_meta = {
+            "selectedProduct": latest_doc.get("selectedProduct"),
+            "selectedKey": latest_doc.get("selectedKey"),
+            "fileTimestampUtc": latest_doc.get("fileTimestampUtc"),
+            "variableName": latest_doc.get("variableName"),
+            "cacheHit": False,
+            "io": None,
+            "checkedProducts": None,
+        }
+
+        latest_result = {
+            "weightedHourlyRainInches": latest_doc.get("rainInches"),
+            "attemptedPointCount": latest_doc.get("attemptedPointCount"),
+            "successfulPointCount": latest_doc.get("successfulPointCount"),
+            "samples": latest_doc.get("samples"),
+            "hourlyRainInches": latest_doc.get("rainInches"),
+            "nearestGridLatitude": latest_doc.get("nearestGridLatitude"),
+            "nearestGridLongitude": latest_doc.get("nearestGridLongitude"),
+            "nearestGridLongitudeRaw": latest_doc.get("nearestGridLongitudeRaw"),
+            "queryLongitudeUsed": latest_doc.get("queryLongitudeUsed"),
+            "longitudeMode": latest_doc.get("longitudeMode"),
+        }
+
+        last24, daily30 = rebuild_last24_and_daily30(field["id"])
+        parent_payload = build_latest_payload(
+            field=field,
+            meta=latest_meta,
+            mode=latest_doc.get("mode") or mode,
+            radius_miles=latest_doc.get("radiusMiles") or radius_miles,
+            result=latest_result,
+            last24=last24,
+            daily30=daily30,
+        )
+        parent_ref.set(parent_payload, merge=True)
+
+    return {
+        "fieldId": field["id"],
+        "fieldName": field.get("name"),
+        "daysRequested": days,
+        "hoursRequested": total_hours,
+        "ok": ok,
+        "skippedNoFile": skipped,
+        "fail": fail,
+        "historySubcollection": MRMS_HOURLY_SUBCOLLECTION,
+        "failures": failures[:50],
+    }
+
+
 @app.get("/")
 def root():
     return jsonify({
@@ -598,11 +941,16 @@ def root():
         "service": "FarmVista NOAA MRMS Pass2->Pass1 fallback rainfall service",
         "productPriority": PRODUCT_PRIORITY,
         "writesToCollection": WEATHER_CACHE_COLLECTION,
+        "historySubcollection": MRMS_HOURLY_SUBCOLLECTION,
+        "latestField": "mrmsHourlyLatest",
+        "last24Field": "mrmsHourlyLast24",
+        "daily30Field": "mrmsDailySeries30d",
         "routes": {
             "single": "/api/mrms-1h?lat=39.7898&lon=-91.2059",
             "weighted": "/api/mrms-1h?lat=39.7898&lon=-91.2059&radiusMiles=0.5&mode=weighted",
             "bulkGet": "/api/mrms-bulk?points=39.7898,-91.2059;39.8050,-91.1800&mode=weighted&radiusMiles=0.5",
             "runBatchCache": "/run?mode=weighted&radiusMiles=0.5",
+            "backfillField": "/backfill-field?fieldId=YOUR_FIELD_ID&days=30&mode=weighted&radiusMiles=0.5",
         },
     })
 
@@ -713,75 +1061,6 @@ def api_mrms_bulk_get():
         }), 500
 
 
-@app.post("/api/mrms-bulk")
-def api_mrms_bulk_post():
-    try:
-        body = request.get_json(silent=True) or {}
-        points = body.get("points") or []
-        mode = str(body.get("mode") or "single").strip().lower()
-        radius_miles = num(body.get("radiusMiles")) or DEFAULT_RADIUS_MILES
-
-        if not isinstance(points, list) or not points:
-            return jsonify({"ok": False, "error": "JSON body must include points array"}), 400
-        if len(points) > MAX_BULK_POINTS:
-            return jsonify({"ok": False, "error": f"Too many points. Max {MAX_BULK_POINTS}"}), 400
-        if mode not in {"single", "weighted"}:
-            return jsonify({"ok": False, "error": "mode must be 'single' or 'weighted'"}), 400
-        if radius_miles <= 0:
-            return jsonify({"ok": False, "error": "radiusMiles must be > 0"}), 400
-
-        cleaned_points = []
-        for idx, p in enumerate(points):
-            if not isinstance(p, dict):
-                return jsonify({"ok": False, "error": f"Point {idx} must be an object"}), 400
-            lat = num(p.get("lat"))
-            lon = num(p.get("lon"))
-            validate_point(lat, lon)
-            cleaned_points.append({"lat": lat, "lon": lon})
-
-        meta = get_cached_dataset()
-        da = meta["dataArray"]
-
-        results = []
-        total_grid_samples = 0
-
-        for idx, p in enumerate(cleaned_points):
-            if mode == "single":
-                result = build_single_result(da, p["lat"], p["lon"])
-                total_grid_samples += 1
-            else:
-                result = build_weighted_result(da, p["lat"], p["lon"], radius_miles)
-                total_grid_samples += 6
-
-            results.append({
-                "index": idx,
-                **result,
-            })
-
-        return jsonify({
-            "ok": True,
-            "source": "noaa-mrms-aws",
-            "mode": mode,
-            "units": "inches",
-            "selectedProduct": meta["selectedProduct"],
-            "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
-            "fileTimestampUtc": meta["fileTimestampUtc"],
-            "variableName": meta["variableName"],
-            "cacheHit": meta["cacheHit"],
-            "checkedProducts": meta["checkedProducts"],
-            "io": meta["io"],
-            "pointCount": len(cleaned_points),
-            "totalGridSamples": total_grid_samples,
-            "results": results,
-        })
-
-    except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e),
-        }), 500
-
-
 @app.get("/run")
 def run_batch():
     try:
@@ -795,6 +1074,42 @@ def run_batch():
             "mode": mode,
             "radiusMiles": radius_miles if mode == "weighted" else None,
             "writesToCollection": WEATHER_CACHE_COLLECTION,
+            "historySubcollection": MRMS_HOURLY_SUBCOLLECTION,
+            "latestField": "mrmsHourlyLatest",
+            "last24Field": "mrmsHourlyLast24",
+            "daily30Field": "mrmsDailySeries30d",
+            "result": out,
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+        }), 500
+
+
+@app.get("/backfill-field")
+def backfill_field_route():
+    try:
+        field_id = str(request.args.get("fieldId") or "").strip()
+        days = int(clamp(request.args.get("days") or 30, 1, 30))
+        mode = (request.args.get("mode") or "weighted").strip().lower()
+        radius_miles = num(request.args.get("radiusMiles")) or DEFAULT_RADIUS_MILES
+
+        if not field_id:
+            return jsonify({"ok": False, "error": "Missing fieldId"}), 400
+
+        out = backfill_field(
+            field_id=field_id,
+            days=days,
+            mode=mode,
+            radius_miles=radius_miles,
+        )
+
+        return jsonify({
+            "ok": True,
+            "mode": mode,
+            "radiusMiles": radius_miles if mode == "weighted" else None,
             "result": out,
         })
 

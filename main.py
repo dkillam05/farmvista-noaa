@@ -3,6 +3,7 @@ import math
 import os
 import tempfile
 import threading
+import time
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
@@ -34,6 +35,10 @@ APP_TIMEZONE = os.environ.get("FV_TIMEZONE", "America/Chicago")
 KEEP_DAYS = 30
 KEEP_HOURS = KEEP_DAYS * 24
 LAST24_COUNT = 24
+
+# New worker-style limits
+DEFAULT_BACKFILL_MAX_FIELDS_PER_RUN = int(os.environ.get("FV_BACKFILL_MAX_FIELDS_PER_RUN", "9999"))
+DEFAULT_BACKFILL_MAX_MINUTES_PER_RUN = float(os.environ.get("FV_BACKFILL_MAX_MINUTES_PER_RUN", "50"))
 
 PRODUCT_PRIORITY = [
     "MultiSensor_QPE_01H_Pass2_00.00",
@@ -1038,7 +1043,7 @@ def claim_next_backfill():
     return ref, claimed_doc
 
 
-def process_next_backfill():
+def process_one_backfill_job():
     ref, queued = claim_next_backfill()
     if not ref:
         return {"processed": False, "message": "No queued backfill jobs found"}
@@ -1072,6 +1077,55 @@ def process_next_backfill():
         return {"processed": True, "queueStatus": "failed", "error": str(e), "fieldId": field_id}
 
 
+def process_next_backfill(max_fields=None, max_minutes=None):
+    max_fields = int(clamp(max_fields if max_fields is not None else DEFAULT_BACKFILL_MAX_FIELDS_PER_RUN, 1, 100000))
+    max_minutes = float(clamp(max_minutes if max_minutes is not None else DEFAULT_BACKFILL_MAX_MINUTES_PER_RUN, 1, 55))
+
+    start = time.time()
+    processed_count = 0
+    done_count = 0
+    failed_count = 0
+    results = []
+
+    while True:
+        elapsed_minutes = (time.time() - start) / 60.0
+        if processed_count >= max_fields:
+            break
+        if elapsed_minutes >= max_minutes:
+            break
+
+        one = process_one_backfill_job()
+        if not one.get("processed"):
+            break
+
+        processed_count += 1
+        if one.get("queueStatus") == "done":
+            done_count += 1
+        elif one.get("queueStatus") == "failed":
+            failed_count += 1
+
+        results.append(one)
+
+    remaining = queue_counts()
+
+    return {
+        "processed": processed_count > 0,
+        "processedCount": processed_count,
+        "doneCount": done_count,
+        "failedCount": failed_count,
+        "elapsedMinutes": round_num((time.time() - start) / 60.0, 2),
+        "stoppedReason": (
+            "queue_empty" if remaining["queued"] == 0 else
+            "max_fields_reached" if processed_count >= max_fields else
+            "max_minutes_reached"
+        ),
+        "maxFields": max_fields,
+        "maxMinutes": max_minutes,
+        "remaining": remaining,
+        "results": results,
+    }
+
+
 def queue_status(limit=50):
     db = get_db()
     docs = list(
@@ -1095,6 +1149,20 @@ def queue_status(limit=50):
     return rows
 
 
+def queue_counts():
+    db = get_db()
+    out = {"queued": 0, "running": 0, "done": 0, "failed": 0}
+    for status in out.keys():
+        docs = list(
+            db.collection(MRMS_BACKFILL_QUEUE_COLLECTION)
+            .where("status", "==", status)
+            .limit(10000)
+            .stream()
+        )
+        out[status] = len(docs)
+    return out
+
+
 @app.get("/")
 def root():
     return jsonify({
@@ -1111,7 +1179,7 @@ def root():
             "backfillField": "/backfill-field?fieldId=YOUR_FIELD_ID&days=30&mode=weighted&radiusMiles=0.5",
             "enqueueBackfill": "/enqueue-backfill?fieldId=YOUR_FIELD_ID&days=30&mode=weighted&radiusMiles=0.5",
             "enqueueBackfillAll": "/enqueue-backfill-all?days=30&mode=weighted&radiusMiles=0.5",
-            "processNextBackfill": "/process-next-backfill",
+            "processNextBackfill": "/process-next-backfill?maxFields=9999&maxMinutes=50",
             "queueStatus": "/queue-status",
         },
     })
@@ -1271,7 +1339,9 @@ def enqueue_backfill_all_route():
 @app.get("/process-next-backfill")
 def process_next_backfill_route():
     try:
-        out = process_next_backfill()
+        max_fields = request.args.get("maxFields")
+        max_minutes = request.args.get("maxMinutes")
+        out = process_next_backfill(max_fields=max_fields, max_minutes=max_minutes)
         return jsonify({"ok": True, "result": out})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
@@ -1282,7 +1352,12 @@ def queue_status_route():
     try:
         limit = int(clamp(request.args.get("limit") or 50, 1, 200))
         out = queue_status(limit=limit)
-        return jsonify({"ok": True, "queueCollection": MRMS_BACKFILL_QUEUE_COLLECTION, "items": out})
+        return jsonify({
+            "ok": True,
+            "queueCollection": MRMS_BACKFILL_QUEUE_COLLECTION,
+            "counts": queue_counts(),
+            "items": out
+        })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 

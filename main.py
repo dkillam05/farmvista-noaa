@@ -936,6 +936,68 @@ def enqueue_backfill(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RA
     }
 
 
+def enqueue_backfill_all(days=30, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
+    db = get_db()
+    fields = load_active_fields_for_batch()
+
+    days = int(clamp(days, 1, 30))
+    if mode not in {"single", "weighted"}:
+        raise RuntimeError("mode must be 'single' or 'weighted'")
+    if radius_miles <= 0:
+        raise RuntimeError("radiusMiles must be > 0")
+
+    queued = 0
+    failed = 0
+    failures = []
+
+    batch = db.batch()
+    writes = 0
+
+    for field in fields:
+        try:
+            ref = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION).document(field["id"])
+            batch.set(ref, {
+                "fieldId": field["id"],
+                "fieldName": field.get("name"),
+                "status": "queued",
+                "days": days,
+                "mode": mode,
+                "radiusMiles": radius_miles,
+                "createdAt": firestore.SERVER_TIMESTAMP,
+                "updatedAt": firestore.SERVER_TIMESTAMP,
+                "startedAt": None,
+                "finishedAt": None,
+                "error": None,
+                "attempts": firestore.Increment(1),
+            }, merge=True)
+            queued += 1
+            writes += 1
+
+            if writes >= 400:
+                batch.commit()
+                batch = db.batch()
+                writes = 0
+
+        except Exception as e:
+            failed += 1
+            failures.append({
+                "fieldId": field["id"],
+                "fieldName": field.get("name"),
+                "error": str(e),
+            })
+
+    if writes > 0:
+        batch.commit()
+
+    return {
+        "totalActiveFields": len(fields),
+        "queued": queued,
+        "failed": failed,
+        "queueCollection": MRMS_BACKFILL_QUEUE_COLLECTION,
+        "failures": failures[:50],
+    }
+
+
 def claim_next_backfill():
     db = get_db()
     queue_ref = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION)
@@ -951,7 +1013,6 @@ def claim_next_backfill():
 
     doc = candidates[0]
     ref = doc.reference
-    claimed = {"ok": False}
 
     @firestore.transactional
     def txn_claim(transaction, doc_ref):
@@ -1049,6 +1110,7 @@ def root():
             "runBatchCache": "/run?mode=weighted&radiusMiles=0.5",
             "backfillField": "/backfill-field?fieldId=YOUR_FIELD_ID&days=30&mode=weighted&radiusMiles=0.5",
             "enqueueBackfill": "/enqueue-backfill?fieldId=YOUR_FIELD_ID&days=30&mode=weighted&radiusMiles=0.5",
+            "enqueueBackfillAll": "/enqueue-backfill-all?days=30&mode=weighted&radiusMiles=0.5",
             "processNextBackfill": "/process-next-backfill",
             "queueStatus": "/queue-status",
         },
@@ -1188,6 +1250,19 @@ def enqueue_backfill_route():
             return jsonify({"ok": False, "error": "Missing fieldId"}), 400
 
         out = enqueue_backfill(field_id=field_id, days=days, mode=mode, radius_miles=radius_miles)
+        return jsonify({"ok": True, "result": out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/enqueue-backfill-all")
+def enqueue_backfill_all_route():
+    try:
+        days = int(clamp(request.args.get("days") or 30, 1, 30))
+        mode = (request.args.get("mode") or "weighted").strip().lower()
+        radius_miles = num(request.args.get("radiusMiles")) or DEFAULT_RADIUS_MILES
+
+        out = enqueue_backfill_all(days=days, mode=mode, radius_miles=radius_miles)
         return jsonify({"ok": True, "result": out})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500

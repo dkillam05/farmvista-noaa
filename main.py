@@ -22,10 +22,10 @@ DEFAULT_REGION = "CONUS"
 DEFAULT_RADIUS_MILES = 0.5
 MAX_BULK_POINTS = 1000
 
+# Prefer Pass 2, then fall back to Pass 1
 PRODUCT_PRIORITY = [
     "MultiSensor_QPE_01H_Pass2_00.00",
     "MultiSensor_QPE_01H_Pass1_00.00",
-    "RadarOnly_QPE_01H_00.00",
 ]
 
 SAMPLE_POINTS = [
@@ -150,7 +150,7 @@ def list_latest_key(region, product, now_utc, max_age_hours=12):
     return pool[-1][1]
 
 
-def pick_best_product_and_key(now_utc):
+def pick_best_available_key(now_utc):
     checked = []
 
     for product in PRODUCT_PRIORITY:
@@ -163,7 +163,7 @@ def pick_best_product_and_key(now_utc):
         if key:
             return product, key, checked
 
-    raise RuntimeError("No usable MRMS hourly QPE file found in NOAA AWS bucket.")
+    raise RuntimeError("No usable MRMS Pass2 or Pass1 hourly QPE file found in NOAA AWS bucket.")
 
 
 def open_dataset_from_s3_key(s3_key):
@@ -231,7 +231,6 @@ def detect_lon_convention(da):
     lon_min = float(np.nanmin(lon_vals))
     lon_max = float(np.nanmax(lon_vals))
 
-    # MRMS often uses 0..360 longitudes
     if lon_min >= 0.0 and lon_max > 180.0:
         return "0_360"
 
@@ -250,7 +249,7 @@ def to_signed_lon(lon):
 
 def get_cached_dataset():
     now_utc = datetime.now(timezone.utc)
-    product, s3_key, checked = pick_best_product_and_key(now_utc)
+    product, s3_key, checked = pick_best_available_key(now_utc)
     file_ts = parse_timestamp_from_key(s3_key)
 
     with CACHE_LOCK:
@@ -419,12 +418,13 @@ def build_weighted_result(da, lat, lon, radius_miles):
 def root():
     return jsonify({
         "ok": True,
-        "service": "FarmVista NOAA MRMS rainfall bulk service",
+        "service": "FarmVista NOAA MRMS Pass2->Pass1 fallback rainfall service",
+        "productPriority": PRODUCT_PRIORITY,
         "routes": {
-            "single": "/api/mrms-1h?lat=47.99306&lon=-84.77361",
-            "weighted": "/api/mrms-1h?lat=47.99306&lon=-84.77361&radiusMiles=0.5&mode=weighted",
-            "bulkGet": "/api/mrms-bulk?points=47.99306,-84.77361;48.01278,-84.72167&mode=weighted&radiusMiles=0.5",
-            "bulkPost": "POST /api/mrms-bulk  JSON: {\"points\":[{\"lat\":47.99,\"lon\":-84.77}],\"mode\":\"weighted\",\"radiusMiles\":0.5}",
+            "single": "/api/mrms-1h?lat=39.7898&lon=-91.2059",
+            "weighted": "/api/mrms-1h?lat=39.7898&lon=-91.2059&radiusMiles=0.5&mode=weighted",
+            "bulkGet": "/api/mrms-bulk?points=39.7898,-91.2059;39.8050,-91.1800&mode=weighted&radiusMiles=0.5",
+            "bulkPost": "POST /api/mrms-bulk  JSON: {\"points\":[{\"lat\":39.78,\"lon\":-91.20}],\"mode\":\"weighted\",\"radiusMiles\":0.5}",
         },
     })
 

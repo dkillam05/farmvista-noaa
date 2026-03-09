@@ -226,6 +226,28 @@ def normalize_data_array(da):
     return da
 
 
+def detect_lon_convention(da):
+    lon_vals = da["longitude"].values
+    lon_min = float(np.nanmin(lon_vals))
+    lon_max = float(np.nanmax(lon_vals))
+
+    # MRMS often uses 0..360 longitudes
+    if lon_min >= 0.0 and lon_max > 180.0:
+        return "0_360"
+
+    return "signed"
+
+
+def to_dataset_lon(lon, lon_mode):
+    if lon_mode == "0_360":
+        return lon if lon >= 0 else lon + 360.0
+    return lon
+
+
+def to_signed_lon(lon):
+    return lon - 360.0 if lon > 180.0 else lon
+
+
 def get_cached_dataset():
     now_utc = datetime.now(timezone.utc)
     product, s3_key, checked = pick_best_product_and_key(now_utc)
@@ -267,28 +289,11 @@ def get_cached_dataset():
         }
 
 
-def sample_nearest_inches(da, lat, lon):
-    sampled = da.sel(latitude=lat, longitude=lon, method="nearest")
-
-    value = sampled.values
-    if isinstance(value, np.ndarray):
-        value = np.asarray(value).squeeze()
-        if np.size(value) != 1:
-            raise RuntimeError("Unexpected non-scalar sampled value from MRMS dataset.")
-        value = float(value)
-    else:
-        value = float(value)
-
-    if not math.isfinite(value):
-        return 0.0
-    if value < 0:
-        return 0.0
-
-    return value
-
-
 def sample_nearest_with_grid(da, lat, lon):
-    sampled = da.sel(latitude=lat, longitude=lon, method="nearest")
+    lon_mode = detect_lon_convention(da)
+    query_lon = to_dataset_lon(lon, lon_mode)
+
+    sampled = da.sel(latitude=lat, longitude=query_lon, method="nearest")
 
     value = sampled.values
     if isinstance(value, np.ndarray):
@@ -300,7 +305,8 @@ def sample_nearest_with_grid(da, lat, lon):
         value = float(value)
 
     grid_lat = float(sampled["latitude"].values)
-    grid_lon = float(sampled["longitude"].values)
+    raw_grid_lon = float(sampled["longitude"].values)
+    signed_grid_lon = to_signed_lon(raw_grid_lon)
 
     if not math.isfinite(value) or value < 0:
         value = 0.0
@@ -308,7 +314,10 @@ def sample_nearest_with_grid(da, lat, lon):
     return {
         "inches": value,
         "nearestGridLatitude": grid_lat,
-        "nearestGridLongitude": grid_lon,
+        "nearestGridLongitude": signed_grid_lon,
+        "nearestGridLongitudeRaw": raw_grid_lon,
+        "queryLongitudeUsed": query_lon,
+        "longitudeMode": lon_mode,
     }
 
 
@@ -363,6 +372,9 @@ def build_single_result(da, lat, lon):
         "hourlyRainInches": round_num(sampled["inches"], 4),
         "nearestGridLatitude": round_num(sampled["nearestGridLatitude"], 6),
         "nearestGridLongitude": round_num(sampled["nearestGridLongitude"], 6),
+        "nearestGridLongitudeRaw": round_num(sampled["nearestGridLongitudeRaw"], 6),
+        "queryLongitudeUsed": round_num(sampled["queryLongitudeUsed"], 6),
+        "longitudeMode": sampled["longitudeMode"],
     }
 
 
@@ -381,6 +393,9 @@ def build_weighted_result(da, lat, lon, radius_miles):
             "inches": round_num(sampled["inches"], 4),
             "nearestGridLatitude": round_num(sampled["nearestGridLatitude"], 6),
             "nearestGridLongitude": round_num(sampled["nearestGridLongitude"], 6),
+            "nearestGridLongitudeRaw": round_num(sampled["nearestGridLongitudeRaw"], 6),
+            "queryLongitudeUsed": round_num(sampled["queryLongitudeUsed"], 6),
+            "longitudeMode": sampled["longitudeMode"],
             "ok": True,
         }
         samples.append(rec)
@@ -406,10 +421,10 @@ def root():
         "ok": True,
         "service": "FarmVista NOAA MRMS rainfall bulk service",
         "routes": {
-            "single": "/api/mrms-1h?lat=39.7898&lon=-91.2059",
-            "weighted": "/api/mrms-1h?lat=39.7898&lon=-91.2059&radiusMiles=0.5&mode=weighted",
-            "bulkGet": "/api/mrms-bulk?points=39.7898,-91.2059;39.8,-91.19&mode=weighted&radiusMiles=0.5",
-            "bulkPost": "POST /api/mrms-bulk  JSON: {\"points\":[{\"lat\":39.78,\"lon\":-91.20}],\"mode\":\"weighted\",\"radiusMiles\":0.5}",
+            "single": "/api/mrms-1h?lat=47.99306&lon=-84.77361",
+            "weighted": "/api/mrms-1h?lat=47.99306&lon=-84.77361&radiusMiles=0.5&mode=weighted",
+            "bulkGet": "/api/mrms-bulk?points=47.99306,-84.77361;48.01278,-84.72167&mode=weighted&radiusMiles=0.5",
+            "bulkPost": "POST /api/mrms-bulk  JSON: {\"points\":[{\"lat\":47.99,\"lon\":-84.77}],\"mode\":\"weighted\",\"radiusMiles\":0.5}",
         },
     })
 

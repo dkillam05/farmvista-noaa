@@ -12,6 +12,8 @@ try:
     import fsspec
     import numpy as np
     import xarray as xr
+    import firebase_admin
+    from firebase_admin import credentials, firestore
 except Exception as e:
     IMPORT_ERROR = str(e)
 
@@ -21,6 +23,9 @@ AWS_BUCKET = "noaa-mrms-pds"
 DEFAULT_REGION = "CONUS"
 DEFAULT_RADIUS_MILES = 0.5
 MAX_BULK_POINTS = 1000
+
+WEATHER_CACHE_COLLECTION = os.environ.get("FV_WEATHER_CACHE_COLLECTION", "field_weather_cache")
+FIELDS_COLLECTION = os.environ.get("FV_FIELDS_COLLECTION", "fields")
 
 # Prefer Pass 2, then fall back to Pass 1
 PRODUCT_PRIORITY = [
@@ -47,6 +52,8 @@ CACHE = {
     "io": None,
 }
 
+_DB = None
+
 
 def num(value):
     try:
@@ -54,6 +61,13 @@ def num(value):
         return n if math.isfinite(n) else None
     except Exception:
         return None
+
+
+def clamp(n, lo, hi):
+    n = num(n)
+    if n is None:
+        return lo
+    return max(lo, min(hi, n))
 
 
 def round_num(value, digits=4):
@@ -92,6 +106,20 @@ def ensure_runtime_ready():
 def get_fs():
     ensure_runtime_ready()
     return fsspec.filesystem("s3", anon=True)
+
+
+def get_db():
+    global _DB
+    ensure_runtime_ready()
+
+    if _DB is not None:
+        return _DB
+
+    if not firebase_admin._apps:
+        firebase_admin.initialize_app()
+
+    _DB = firestore.client()
+    return _DB
 
 
 def list_candidate_dates(now_utc, days_back=2):
@@ -414,17 +442,167 @@ def build_weighted_result(da, lat, lon, radius_miles):
     }
 
 
+def load_active_fields_for_batch():
+    db = get_db()
+    raw = []
+
+    try:
+        snap = db.collection(FIELDS_COLLECTION).where("status", "==", "active").stream()
+        for doc in snap:
+            raw.append({"id": doc.id, "data": doc.to_dict() or {}})
+    except Exception as e:
+        print(f"[Batch] fields query(status==active) failed: {e}")
+
+    if not raw:
+        try:
+            snap2 = db.collection(FIELDS_COLLECTION).stream()
+            for doc in snap2:
+                raw.append({"id": doc.id, "data": doc.to_dict() or {}})
+        except Exception as e:
+            print(f"[Batch] fields query(all) failed: {e}")
+            raw = []
+
+    out = []
+    for r in raw:
+        d = r["data"] or {}
+        status = str(d.get("status", "")).strip().lower()
+        if status != "active":
+            continue
+
+        loc = d.get("location") or {}
+        lat = num(loc.get("lat"))
+        lng = num(loc.get("lng"))
+        if lat is None or lng is None:
+            continue
+
+        out.append({
+            "id": r["id"],
+            "name": str(d.get("name") or ""),
+            "farmId": d.get("farmId"),
+            "farmName": d.get("farmName"),
+            "lat": lat,
+            "lng": lng,
+        })
+
+    return out
+
+
+def build_firestore_payload(field, meta, mode, radius_miles, result):
+    payload = {
+        "fieldId": field["id"],
+        "fieldName": field.get("name") or None,
+        "farmId": field.get("farmId"),
+        "farmName": field.get("farmName"),
+        "location": {
+            "lat": field["lat"],
+            "lng": field["lng"],
+        },
+        "mrmsHourlyLatest": {
+            "source": "noaa-mrms-aws",
+            "selectedProduct": meta["selectedProduct"],
+            "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
+            "fileTimestampUtc": meta["fileTimestampUtc"],
+            "variableName": meta["variableName"],
+            "mode": mode,
+            "radiusMiles": radius_miles if mode == "weighted" else None,
+            "cacheHit": meta["cacheHit"],
+            "io": meta["io"],
+            "checkedProducts": meta["checkedProducts"],
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+        },
+        "mrmsLastUpdatedAt": firestore.SERVER_TIMESTAMP,
+    }
+
+    if mode == "single":
+        payload["mrmsHourlyLatest"]["hourlyRainInches"] = result["hourlyRainInches"]
+        payload["mrmsHourlyLatest"]["nearestGridLatitude"] = result["nearestGridLatitude"]
+        payload["mrmsHourlyLatest"]["nearestGridLongitude"] = result["nearestGridLongitude"]
+        payload["mrmsHourlyLatest"]["nearestGridLongitudeRaw"] = result["nearestGridLongitudeRaw"]
+        payload["mrmsHourlyLatest"]["queryLongitudeUsed"] = result["queryLongitudeUsed"]
+        payload["mrmsHourlyLatest"]["longitudeMode"] = result["longitudeMode"]
+    else:
+        payload["mrmsHourlyLatest"]["weightedHourlyRainInches"] = result["weightedHourlyRainInches"]
+        payload["mrmsHourlyLatest"]["attemptedPointCount"] = result["attemptedPointCount"]
+        payload["mrmsHourlyLatest"]["successfulPointCount"] = result["successfulPointCount"]
+        payload["mrmsHourlyLatest"]["samples"] = result["samples"]
+
+    return payload
+
+
+def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
+    db = get_db()
+    fields = load_active_fields_for_batch()
+    total = len(fields)
+
+    if mode not in {"single", "weighted"}:
+        raise RuntimeError("mode must be 'single' or 'weighted'")
+    if radius_miles <= 0:
+        raise RuntimeError("radiusMiles must be > 0")
+
+    meta = get_cached_dataset()
+    da = meta["dataArray"]
+
+    batch = db.batch()
+    writes = 0
+    ok = 0
+    fail = 0
+    failures = []
+
+    for field in fields:
+        try:
+            if mode == "single":
+                result = build_single_result(da, field["lat"], field["lng"])
+            else:
+                result = build_weighted_result(da, field["lat"], field["lng"], radius_miles)
+
+            doc_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field["id"])
+            payload = build_firestore_payload(field, meta, mode, radius_miles, result)
+
+            batch.set(doc_ref, payload, merge=True)
+            writes += 1
+            ok += 1
+
+            if writes >= 400:
+                batch.commit()
+                batch = db.batch()
+                writes = 0
+
+        except Exception as e:
+            fail += 1
+            failures.append({
+                "fieldId": field["id"],
+                "fieldName": field.get("name"),
+                "error": str(e),
+            })
+
+    if writes > 0:
+        batch.commit()
+
+    return {
+        "total": total,
+        "ok": ok,
+        "fail": fail,
+        "collection": WEATHER_CACHE_COLLECTION,
+        "selectedProduct": meta["selectedProduct"],
+        "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
+        "fileTimestampUtc": meta["fileTimestampUtc"],
+        "cacheHit": meta["cacheHit"],
+        "failures": failures[:25],
+    }
+
+
 @app.get("/")
 def root():
     return jsonify({
         "ok": True,
         "service": "FarmVista NOAA MRMS Pass2->Pass1 fallback rainfall service",
         "productPriority": PRODUCT_PRIORITY,
+        "writesToCollection": WEATHER_CACHE_COLLECTION,
         "routes": {
             "single": "/api/mrms-1h?lat=39.7898&lon=-91.2059",
             "weighted": "/api/mrms-1h?lat=39.7898&lon=-91.2059&radiusMiles=0.5&mode=weighted",
             "bulkGet": "/api/mrms-bulk?points=39.7898,-91.2059;39.8050,-91.1800&mode=weighted&radiusMiles=0.5",
-            "bulkPost": "POST /api/mrms-bulk  JSON: {\"points\":[{\"lat\":39.78,\"lon\":-91.20}],\"mode\":\"weighted\",\"radiusMiles\":0.5}",
+            "runBatchCache": "/run?mode=weighted&radiusMiles=0.5",
         },
     })
 
@@ -595,6 +773,29 @@ def api_mrms_bulk_post():
             "pointCount": len(cleaned_points),
             "totalGridSamples": total_grid_samples,
             "results": results,
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+        }), 500
+
+
+@app.get("/run")
+def run_batch():
+    try:
+        mode = (request.args.get("mode") or "weighted").strip().lower()
+        radius_miles = num(request.args.get("radiusMiles")) or DEFAULT_RADIUS_MILES
+
+        out = run_batch_cache(mode=mode, radius_miles=radius_miles)
+
+        return jsonify({
+            "ok": True,
+            "mode": mode,
+            "radiusMiles": radius_miles if mode == "weighted" else None,
+            "writesToCollection": WEATHER_CACHE_COLLECTION,
+            "result": out,
         })
 
     except Exception as e:

@@ -38,6 +38,7 @@ LAST24_COUNT = 24
 
 DEFAULT_BACKFILL_MAX_FIELDS_PER_RUN = int(os.environ.get("FV_BACKFILL_MAX_FIELDS_PER_RUN", "9999"))
 DEFAULT_BACKFILL_MAX_MINUTES_PER_RUN = float(os.environ.get("FV_BACKFILL_MAX_MINUTES_PER_RUN", "50"))
+DEFAULT_REPAIR_LOOKBACK_HOURS = int(os.environ.get("FV_REPAIR_LOOKBACK_HOURS", "12"))
 
 PRODUCT_PRIORITY = [
     "MultiSensor_QPE_01H_Pass2_00.00",
@@ -156,12 +157,24 @@ def parse_timestamp_from_key(key):
         return None
 
 
+def parse_iso_utc(iso_str):
+    return datetime.fromisoformat(str(iso_str).replace("Z", "+00:00")).astimezone(timezone.utc)
+
+
 def iso_utc(dt):
     return dt.astimezone(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def hour_doc_id_from_iso(file_timestamp_utc):
     return file_timestamp_utc.replace("-", "").replace(":", "")
+
+
+def full_backfill_job_id(field_id):
+    return f"full__{field_id}"
+
+
+def repair_job_id(field_id, start_hour_utc, end_hour_utc):
+    return f"repair__{field_id}__{hour_doc_id_from_iso(start_hour_utc)}__{hour_doc_id_from_iso(end_hour_utc)}"
 
 
 def list_latest_key(region, product, now_utc, max_age_hours=12):
@@ -616,7 +629,50 @@ def build_hour_history_entry(meta, mode, radius_miles, result):
     return entry
 
 
-def build_latest_payload(field, meta, mode, radius_miles, result, last24, daily30):
+def get_field_mrms_state(field_id):
+    db = get_db()
+    parent_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field_id)
+    snap = parent_ref.get()
+
+    if not snap.exists:
+        return {
+            "docExists": False,
+            "hasAnyHistory": False,
+            "fullBackfillComplete": False,
+            "daily30Count": 0,
+            "historyMeta": {},
+        }
+
+    data = snap.to_dict() or {}
+    history_meta = data.get("mrmsHistoryMeta") or {}
+    daily30 = data.get("mrmsDailySeries30d") or []
+
+    has_any_history = False
+    if isinstance(daily30, list) and len(daily30) > 0:
+        has_any_history = True
+    else:
+        subdocs = list(
+            parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
+            .limit(1)
+            .stream()
+        )
+        has_any_history = len(subdocs) > 0
+
+    return {
+        "docExists": True,
+        "hasAnyHistory": has_any_history,
+        "fullBackfillComplete": bool(history_meta.get("fullBackfillComplete", False)),
+        "daily30Count": len(daily30) if isinstance(daily30, list) else 0,
+        "historyMeta": history_meta,
+    }
+
+
+def build_latest_payload(field, meta, mode, radius_miles, result, last24, daily30, existing_state):
+    history_meta_old = existing_state.get("historyMeta") or {}
+    full_complete = bool(history_meta_old.get("fullBackfillComplete", False))
+    backfill_completed_at = history_meta_old.get("backfillCompletedAt")
+    latest_repair_enqueued_at = history_meta_old.get("latestRepairEnqueuedAt")
+
     latest = {
         "source": "noaa-mrms-aws",
         "selectedProduct": meta["selectedProduct"],
@@ -662,6 +718,9 @@ def build_latest_payload(field, meta, mode, radius_miles, result, last24, daily3
             "latestSelectedProduct": meta["selectedProduct"],
             "last24Count": len(last24),
             "daily30Count": len(daily30),
+            "fullBackfillComplete": full_complete,
+            "backfillCompletedAt": backfill_completed_at,
+            "latestRepairEnqueuedAt": latest_repair_enqueued_at,
         },
         "mrmsLastUpdatedAt": firestore.SERVER_TIMESTAMP,
     }
@@ -733,7 +792,7 @@ def rebuild_last24_and_daily30(field_id):
             "rainIn": round_num(v["rainIn"], 4),
             "hoursCount": v["hoursCount"],
         }
-        for k, v in sorted(daily_map.items())
+        for _, v in sorted(daily_map.items())
     ][-KEEP_DAYS:]
 
     return last24, daily30
@@ -744,6 +803,7 @@ def write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, resu
     hour_ref.set(history_entry, merge=True)
 
     last24, daily30 = rebuild_last24_and_daily30(field["id"])
+    existing_state = get_field_mrms_state(field["id"])
 
     parent_payload = build_latest_payload(
         field=field,
@@ -753,37 +813,182 @@ def write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, resu
         result=result,
         last24=last24,
         daily30=daily30,
+        existing_state=existing_state,
     )
     parent_ref.set(parent_payload, merge=True)
 
 
-def field_has_mrms_history(field_id):
+def queue_job_exists_active(doc_id):
     db = get_db()
-    parent_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field_id)
-    snap = parent_ref.get()
+    snap = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION).document(doc_id).get()
     if not snap.exists:
         return False
-
     data = snap.to_dict() or {}
+    return str(data.get("status") or "").strip().lower() in {"queued", "running"}
 
-    if data.get("mrmsHistoryMeta"):
-        return True
 
-    daily30 = data.get("mrmsDailySeries30d")
-    if isinstance(daily30, list) and len(daily30) > 0:
-        return True
+def field_needs_full_backfill(field_id):
+    state = get_field_mrms_state(field_id)
+    return not bool(state.get("fullBackfillComplete", False))
 
-    subdocs = list(
-        parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
-        .limit(1)
-        .stream()
-    )
-    return len(subdocs) > 0
+
+def enqueue_backfill(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
+    db = get_db()
+    field = get_field_by_id(field_id)
+    if not field:
+        raise RuntimeError("Field not found")
+
+    days = int(clamp(days, 1, 30))
+    if mode not in {"single", "weighted"}:
+        raise RuntimeError("mode must be 'single' or 'weighted'")
+    if radius_miles <= 0:
+        raise RuntimeError("radiusMiles must be > 0")
+
+    doc_id = full_backfill_job_id(field_id)
+    ref = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION).document(doc_id)
+
+    if queue_job_exists_active(doc_id):
+        return {
+            "fieldId": field_id,
+            "fieldName": field.get("name"),
+            "status": "already_active",
+            "days": days,
+            "mode": mode,
+            "radiusMiles": radius_miles,
+            "jobType": "full_backfill",
+        }
+
+    ref.set({
+        "jobType": "full_backfill",
+        "fieldId": field_id,
+        "fieldName": field.get("name"),
+        "status": "queued",
+        "days": days,
+        "mode": mode,
+        "radiusMiles": radius_miles,
+        "createdAt": firestore.SERVER_TIMESTAMP,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+        "startedAt": None,
+        "finishedAt": None,
+        "error": None,
+        "attempts": firestore.Increment(1),
+    }, merge=True)
+
+    return {
+        "fieldId": field_id,
+        "fieldName": field.get("name"),
+        "status": "queued",
+        "days": days,
+        "mode": mode,
+        "radiusMiles": radius_miles,
+        "jobType": "full_backfill",
+    }
+
+
+def enqueue_gap_repair(field_id, start_hour_utc, end_hour_utc, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
+    db = get_db()
+    field = get_field_by_id(field_id)
+    if not field:
+        raise RuntimeError("Field not found")
+
+    if mode not in {"single", "weighted"}:
+        raise RuntimeError("mode must be 'single' or 'weighted'")
+    if radius_miles <= 0:
+        raise RuntimeError("radiusMiles must be > 0")
+
+    doc_id = repair_job_id(field_id, start_hour_utc, end_hour_utc)
+    ref = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION).document(doc_id)
+
+    if queue_job_exists_active(doc_id):
+        return {
+            "fieldId": field_id,
+            "fieldName": field.get("name"),
+            "status": "already_active",
+            "jobType": "repair_gap",
+            "startHourUtc": start_hour_utc,
+            "endHourUtc": end_hour_utc,
+        }
+
+    ref.set({
+        "jobType": "repair_gap",
+        "fieldId": field_id,
+        "fieldName": field.get("name"),
+        "status": "queued",
+        "days": None,
+        "mode": mode,
+        "radiusMiles": radius_miles,
+        "startHourUtc": start_hour_utc,
+        "endHourUtc": end_hour_utc,
+        "createdAt": firestore.SERVER_TIMESTAMP,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+        "startedAt": None,
+        "finishedAt": None,
+        "error": None,
+        "attempts": firestore.Increment(1),
+    }, merge=True)
+
+    parent_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field_id)
+    parent_ref.set({
+        "mrmsHistoryMeta": {
+            "latestRepairEnqueuedAt": firestore.SERVER_TIMESTAMP
+        }
+    }, merge=True)
+
+    return {
+        "fieldId": field_id,
+        "fieldName": field.get("name"),
+        "status": "queued",
+        "jobType": "repair_gap",
+        "startHourUtc": start_hour_utc,
+        "endHourUtc": end_hour_utc,
+        "mode": mode,
+        "radiusMiles": radius_miles,
+    }
+
+
+def enqueue_backfill_all(days=30, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
+    fields = load_active_fields_for_batch()
+
+    days = int(clamp(days, 1, 30))
+    if mode not in {"single", "weighted"}:
+        raise RuntimeError("mode must be 'single' or 'weighted'")
+    if radius_miles <= 0:
+        raise RuntimeError("radiusMiles must be > 0")
+
+    queued = 0
+    failed = 0
+    failures = []
+
+    for field in fields:
+        try:
+            out = enqueue_backfill(
+                field_id=field["id"],
+                days=days,
+                mode=mode,
+                radius_miles=radius_miles,
+            )
+            if out.get("status") in {"queued", "already_active"}:
+                queued += 1
+        except Exception as e:
+            failed += 1
+            failures.append({
+                "fieldId": field["id"],
+                "fieldName": field.get("name"),
+                "error": str(e),
+            })
+
+    return {
+        "totalActiveFields": len(fields),
+        "queuedOrActive": queued,
+        "failed": failed,
+        "queueCollection": MRMS_BACKFILL_QUEUE_COLLECTION,
+        "failures": failures[:50],
+    }
 
 
 def maybe_auto_enqueue_backfill(field, mode, radius_miles):
-    if field_has_mrms_history(field["id"]):
-        return {"fieldId": field["id"], "queued": False, "reason": "history_exists"}
+    if not field_needs_full_backfill(field["id"]):
+        return {"fieldId": field["id"], "queued": False, "reason": "full_backfill_complete"}
 
     out = enqueue_backfill(
         field_id=field["id"],
@@ -794,8 +999,72 @@ def maybe_auto_enqueue_backfill(field, mode, radius_miles):
     return {"fieldId": field["id"], "queued": True, "result": out}
 
 
-def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
+def find_missing_recent_hours(field_id, latest_hour_utc, lookback_hours):
     db = get_db()
+    parent_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field_id)
+    hourly_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
+
+    latest_dt = parse_iso_utc(latest_hour_utc).replace(minute=0, second=0, microsecond=0)
+    lookback_hours = int(clamp(lookback_hours, 1, 168))
+
+    start_dt = latest_dt - timedelta(hours=(lookback_hours - 1))
+    start_iso = iso_utc(start_dt)
+    end_iso = iso_utc(latest_dt)
+
+    docs = list(
+        hourly_ref.where("fileTimestampUtc", ">=", start_iso)
+        .where("fileTimestampUtc", "<=", end_iso)
+        .stream()
+    )
+
+    existing = set()
+    for doc in docs:
+        d = doc.to_dict() or {}
+        ts = str(d.get("fileTimestampUtc") or "")
+        if ts:
+            existing.add(ts)
+
+    expected = []
+    for i in range(lookback_hours):
+        dt = start_dt + timedelta(hours=i)
+        expected.append(iso_utc(dt))
+
+    missing = [x for x in expected if x not in existing]
+    return missing
+
+
+def maybe_auto_enqueue_gap_repair(field, mode, radius_miles, latest_hour_utc):
+    if field_needs_full_backfill(field["id"]):
+        return {"fieldId": field["id"], "queued": False, "reason": "full_backfill_not_complete"}
+
+    missing = find_missing_recent_hours(
+        field_id=field["id"],
+        latest_hour_utc=latest_hour_utc,
+        lookback_hours=DEFAULT_REPAIR_LOOKBACK_HOURS,
+    )
+
+    if not missing:
+        return {"fieldId": field["id"], "queued": False, "reason": "no_gap"}
+
+    start_hour = missing[0]
+    end_hour = missing[-1]
+
+    out = enqueue_gap_repair(
+        field_id=field["id"],
+        start_hour_utc=start_hour,
+        end_hour_utc=end_hour,
+        mode=mode,
+        radius_miles=radius_miles,
+    )
+    return {
+        "fieldId": field["id"],
+        "queued": True,
+        "missingCount": len(missing),
+        "result": out,
+    }
+
+
+def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
     fields = load_active_fields_for_batch()
     total = len(fields)
 
@@ -810,28 +1079,49 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
     ok = 0
     fail = 0
     failures = []
-    auto_enqueued = 0
-    auto_enqueue_fail = 0
+    auto_enqueued_backfills = 0
+    auto_enqueue_backfill_failures = 0
+    auto_enqueued_repairs = 0
+    auto_enqueue_repair_failures = 0
 
     for field in fields:
         try:
             try:
                 auto = maybe_auto_enqueue_backfill(field, mode, radius_miles)
                 if auto.get("queued"):
-                    auto_enqueued += 1
+                    auto_enqueued_backfills += 1
             except Exception as e:
-                auto_enqueue_fail += 1
-                print(f"[AutoEnqueue] failed for {field['id']}: {e}")
+                auto_enqueue_backfill_failures += 1
+                print(f"[AutoEnqueueFull] failed for {field['id']}: {e}")
 
             result = build_single_result(da, field["lat"], field["lng"]) if mode == "single" else build_weighted_result(da, field["lat"], field["lng"], radius_miles)
-            parent_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field["id"])
+
+            parent_ref = get_db().collection(WEATHER_CACHE_COLLECTION).document(field["id"])
             hour_id = hour_doc_id_from_iso(meta["fileTimestampUtc"])
             hour_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION).document(hour_id)
             write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, result)
             ok += 1
+
+            try:
+                auto_rep = maybe_auto_enqueue_gap_repair(
+                    field=field,
+                    mode=mode,
+                    radius_miles=radius_miles,
+                    latest_hour_utc=meta["fileTimestampUtc"],
+                )
+                if auto_rep.get("queued"):
+                    auto_enqueued_repairs += 1
+            except Exception as e:
+                auto_enqueue_repair_failures += 1
+                print(f"[AutoEnqueueRepair] failed for {field['id']}: {e}")
+
         except Exception as e:
             fail += 1
-            failures.append({"fieldId": field["id"], "fieldName": field.get("name"), "error": str(e)})
+            failures.append({
+                "fieldId": field["id"],
+                "fieldName": field.get("name"),
+                "error": str(e),
+            })
 
     return {
         "total": total,
@@ -842,14 +1132,16 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
         "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
         "fileTimestampUtc": meta["fileTimestampUtc"],
         "cacheHit": meta["cacheHit"],
-        "autoEnqueuedBackfills": auto_enqueued,
-        "autoEnqueueFailures": auto_enqueue_fail,
+        "autoEnqueuedBackfills": auto_enqueued_backfills,
+        "autoEnqueueBackfillFailures": auto_enqueue_backfill_failures,
+        "autoEnqueuedRepairJobs": auto_enqueued_repairs,
+        "autoEnqueueRepairFailures": auto_enqueue_repair_failures,
+        "repairLookbackHours": DEFAULT_REPAIR_LOOKBACK_HOURS,
         "failures": failures[:25],
     }
 
 
 def backfill_field(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
-    db = get_db()
     field = get_field_by_id(field_id)
     if not field:
         raise RuntimeError("Field not found")
@@ -864,7 +1156,7 @@ def backfill_field(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADI
     this_hour = now_utc.replace(minute=0, second=0, microsecond=0)
     total_hours = days * 24
 
-    parent_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field["id"])
+    parent_ref = get_db().collection(WEATHER_CACHE_COLLECTION).document(field["id"])
 
     ok = 0
     skipped = 0
@@ -893,7 +1185,10 @@ def backfill_field(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADI
             ok += 1
         except Exception as e:
             fail += 1
-            failures.append({"targetHourUtc": iso_utc(target_dt), "error": str(e)})
+            failures.append({
+                "targetHourUtc": iso_utc(target_dt),
+                "error": str(e),
+            })
 
     latest_docs = list(
         parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
@@ -935,7 +1230,10 @@ def backfill_field(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADI
             result=latest_result,
             last24=last24,
             daily30=daily30,
+            existing_state=get_field_mrms_state(field["id"]),
         )
+        parent_payload["mrmsHistoryMeta"]["fullBackfillComplete"] = True
+        parent_payload["mrmsHistoryMeta"]["backfillCompletedAt"] = firestore.SERVER_TIMESTAMP
         parent_ref.set(parent_payload, merge=True)
 
     return {
@@ -951,102 +1249,112 @@ def backfill_field(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADI
     }
 
 
-def enqueue_backfill(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
-    db = get_db()
+def repair_field_range(field_id, start_hour_utc, end_hour_utc, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
     field = get_field_by_id(field_id)
     if not field:
         raise RuntimeError("Field not found")
 
-    days = int(clamp(days, 1, 30))
     if mode not in {"single", "weighted"}:
         raise RuntimeError("mode must be 'single' or 'weighted'")
     if radius_miles <= 0:
         raise RuntimeError("radiusMiles must be > 0")
 
-    ref = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION).document(field_id)
-    ref.set({
-        "fieldId": field_id,
-        "fieldName": field.get("name"),
-        "status": "queued",
-        "days": days,
-        "mode": mode,
-        "radiusMiles": radius_miles,
-        "createdAt": firestore.SERVER_TIMESTAMP,
-        "updatedAt": firestore.SERVER_TIMESTAMP,
-        "startedAt": None,
-        "finishedAt": None,
-        "error": None,
-        "attempts": firestore.Increment(1),
-    }, merge=True)
+    start_dt = parse_iso_utc(start_hour_utc).replace(minute=0, second=0, microsecond=0)
+    end_dt = parse_iso_utc(end_hour_utc).replace(minute=0, second=0, microsecond=0)
 
-    return {
-        "fieldId": field_id,
-        "fieldName": field.get("name"),
-        "status": "queued",
-        "days": days,
-        "mode": mode,
-        "radiusMiles": radius_miles,
-    }
+    if end_dt < start_dt:
+        raise RuntimeError("endHourUtc must be >= startHourUtc")
 
+    parent_ref = get_db().collection(WEATHER_CACHE_COLLECTION).document(field["id"])
 
-def enqueue_backfill_all(days=30, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
-    db = get_db()
-    fields = load_active_fields_for_batch()
-
-    days = int(clamp(days, 1, 30))
-    if mode not in {"single", "weighted"}:
-        raise RuntimeError("mode must be 'single' or 'weighted'")
-    if radius_miles <= 0:
-        raise RuntimeError("radiusMiles must be > 0")
-
-    queued = 0
-    failed = 0
+    ok = 0
+    skipped = 0
+    fail = 0
     failures = []
 
-    batch = db.batch()
-    writes = 0
+    cur = start_dt
+    while cur <= end_dt:
+        product, s3_key, checked = pick_best_key_for_hour(cur)
 
-    for field in fields:
+        if not s3_key:
+            skipped += 1
+            cur += timedelta(hours=1)
+            continue
+
         try:
-            ref = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION).document(field["id"])
-            batch.set(ref, {
-                "fieldId": field["id"],
-                "fieldName": field.get("name"),
-                "status": "queued",
-                "days": days,
-                "mode": mode,
-                "radiusMiles": radius_miles,
-                "createdAt": firestore.SERVER_TIMESTAMP,
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-                "startedAt": None,
-                "finishedAt": None,
-                "error": None,
-                "attempts": firestore.Increment(1),
-            }, merge=True)
-            queued += 1
-            writes += 1
+            meta = get_dataset_for_key_uncached(product, s3_key)
+            meta["checkedProducts"] = checked
+            da = meta["dataArray"]
 
-            if writes >= 400:
-                batch.commit()
-                batch = db.batch()
-                writes = 0
+            result = build_single_result(da, field["lat"], field["lng"]) if mode == "single" else build_weighted_result(da, field["lat"], field["lng"], radius_miles)
 
+            hour_id = hour_doc_id_from_iso(meta["fileTimestampUtc"])
+            hour_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION).document(hour_id)
+            history_entry = build_hour_history_entry(meta, mode, radius_miles, result)
+            hour_ref.set(history_entry, merge=True)
+            ok += 1
         except Exception as e:
-            failed += 1
+            fail += 1
             failures.append({
-                "fieldId": field["id"],
-                "fieldName": field.get("name"),
+                "targetHourUtc": iso_utc(cur),
                 "error": str(e),
             })
 
-    if writes > 0:
-        batch.commit()
+        cur += timedelta(hours=1)
+
+    latest_docs = list(
+        parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
+        .order_by("fileTimestampUtc", direction=firestore.Query.DESCENDING)
+        .limit(1)
+        .stream()
+    )
+
+    if latest_docs:
+        latest_doc = latest_docs[0].to_dict() or {}
+        latest_meta = {
+            "selectedProduct": latest_doc.get("selectedProduct"),
+            "selectedKey": latest_doc.get("selectedKey"),
+            "fileTimestampUtc": latest_doc.get("fileTimestampUtc"),
+            "variableName": latest_doc.get("variableName"),
+            "cacheHit": False,
+            "io": None,
+            "checkedProducts": None,
+        }
+        latest_result = {
+            "weightedHourlyRainInches": latest_doc.get("rainInches"),
+            "attemptedPointCount": latest_doc.get("attemptedPointCount"),
+            "successfulPointCount": latest_doc.get("successfulPointCount"),
+            "samples": latest_doc.get("samples"),
+            "hourlyRainInches": latest_doc.get("rainInches"),
+            "nearestGridLatitude": latest_doc.get("nearestGridLatitude"),
+            "nearestGridLongitude": latest_doc.get("nearestGridLongitude"),
+            "nearestGridLongitudeRaw": latest_doc.get("nearestGridLongitudeRaw"),
+            "queryLongitudeUsed": latest_doc.get("queryLongitudeUsed"),
+            "longitudeMode": latest_doc.get("longitudeMode"),
+        }
+
+        last24, daily30 = rebuild_last24_and_daily30(field["id"])
+        parent_payload = build_latest_payload(
+            field=field,
+            meta=latest_meta,
+            mode=latest_doc.get("mode") or mode,
+            radius_miles=latest_doc.get("radiusMiles") or radius_miles,
+            result=latest_result,
+            last24=last24,
+            daily30=daily30,
+            existing_state=get_field_mrms_state(field["id"]),
+        )
+        parent_ref.set(parent_payload, merge=True)
 
     return {
-        "totalActiveFields": len(fields),
-        "queued": queued,
-        "failed": failed,
-        "queueCollection": MRMS_BACKFILL_QUEUE_COLLECTION,
+        "fieldId": field["id"],
+        "fieldName": field.get("name"),
+        "jobType": "repair_gap",
+        "startHourUtc": start_hour_utc,
+        "endHourUtc": end_hour_utc,
+        "ok": ok,
+        "skippedNoFile": skipped,
+        "fail": fail,
         "failures": failures[:50],
     }
 
@@ -1096,25 +1404,49 @@ def process_one_backfill_job():
     if not ref:
         return {"processed": False, "message": "No queued backfill jobs found"}
 
+    job_type = str(queued.get("jobType") or "full_backfill").strip().lower()
     field_id = queued.get("fieldId")
-    days = int(clamp(queued.get("days") or 30, 1, 30))
     mode = str(queued.get("mode") or "weighted").strip().lower()
     radius_miles = num(queued.get("radiusMiles")) or DEFAULT_RADIUS_MILES
 
     try:
-        result = backfill_field(field_id=field_id, days=days, mode=mode, radius_miles=radius_miles)
+        if job_type == "repair_gap":
+            start_hour_utc = str(queued.get("startHourUtc") or "").strip()
+            end_hour_utc = str(queued.get("endHourUtc") or "").strip()
+            if not start_hour_utc or not end_hour_utc:
+                raise RuntimeError("repair_gap queue item missing startHourUtc/endHourUtc")
+
+            result = repair_field_range(
+                field_id=field_id,
+                start_hour_utc=start_hour_utc,
+                end_hour_utc=end_hour_utc,
+                mode=mode,
+                radius_miles=radius_miles,
+            )
+        else:
+            days = int(clamp(queued.get("days") or 30, 1, 30))
+            result = backfill_field(
+                field_id=field_id,
+                days=days,
+                mode=mode,
+                radius_miles=radius_miles,
+            )
+
         ref.set({
             "status": "done",
             "finishedAt": firestore.SERVER_TIMESTAMP,
             "updatedAt": firestore.SERVER_TIMESTAMP,
             "resultSummary": {
-                "okHours": result["ok"],
-                "skippedNoFile": result["skippedNoFile"],
-                "failHours": result["fail"],
+                "okHours": result.get("ok"),
+                "skippedNoFile": result.get("skippedNoFile"),
+                "failHours": result.get("fail"),
+                "jobType": job_type,
             },
             "error": None,
         }, merge=True)
+
         return {"processed": True, "queueStatus": "done", "result": result}
+
     except Exception as e:
         ref.set({
             "status": "failed",
@@ -1122,7 +1454,7 @@ def process_one_backfill_job():
             "updatedAt": firestore.SERVER_TIMESTAMP,
             "error": str(e),
         }, merge=True)
-        return {"processed": True, "queueStatus": "failed", "error": str(e), "fieldId": field_id}
+        return {"processed": True, "queueStatus": "failed", "error": str(e), "fieldId": field_id, "jobType": job_type}
 
 
 def process_next_backfill(max_fields=None, max_minutes=None):
@@ -1186,12 +1518,16 @@ def queue_status(limit=50):
     for doc in docs:
         d = doc.to_dict() or {}
         rows.append({
+            "docId": doc.id,
+            "jobType": d.get("jobType") or "full_backfill",
             "fieldId": d.get("fieldId") or doc.id,
             "fieldName": d.get("fieldName"),
             "status": d.get("status"),
             "days": d.get("days"),
             "mode": d.get("mode"),
             "radiusMiles": d.get("radiusMiles"),
+            "startHourUtc": d.get("startHourUtc"),
+            "endHourUtc": d.get("endHourUtc"),
             "error": d.get("error"),
         })
     return rows
@@ -1220,6 +1556,7 @@ def root():
         "writesToCollection": WEATHER_CACHE_COLLECTION,
         "historySubcollection": MRMS_HOURLY_SUBCOLLECTION,
         "queueCollection": MRMS_BACKFILL_QUEUE_COLLECTION,
+        "repairLookbackHours": DEFAULT_REPAIR_LOOKBACK_HOURS,
         "routes": {
             "single": "/api/mrms-1h?lat=39.7898&lon=-91.2059",
             "weighted": "/api/mrms-1h?lat=39.7898&lon=-91.2059&radiusMiles=0.5&mode=weighted",

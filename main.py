@@ -36,7 +36,6 @@ KEEP_DAYS = 30
 KEEP_HOURS = KEEP_DAYS * 24
 LAST24_COUNT = 24
 
-# New worker-style limits
 DEFAULT_BACKFILL_MAX_FIELDS_PER_RUN = int(os.environ.get("FV_BACKFILL_MAX_FIELDS_PER_RUN", "9999"))
 DEFAULT_BACKFILL_MAX_MINUTES_PER_RUN = float(os.environ.get("FV_BACKFILL_MAX_MINUTES_PER_RUN", "50"))
 
@@ -758,6 +757,43 @@ def write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, resu
     parent_ref.set(parent_payload, merge=True)
 
 
+def field_has_mrms_history(field_id):
+    db = get_db()
+    parent_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field_id)
+    snap = parent_ref.get()
+    if not snap.exists:
+        return False
+
+    data = snap.to_dict() or {}
+
+    if data.get("mrmsHistoryMeta"):
+        return True
+
+    daily30 = data.get("mrmsDailySeries30d")
+    if isinstance(daily30, list) and len(daily30) > 0:
+        return True
+
+    subdocs = list(
+        parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
+        .limit(1)
+        .stream()
+    )
+    return len(subdocs) > 0
+
+
+def maybe_auto_enqueue_backfill(field, mode, radius_miles):
+    if field_has_mrms_history(field["id"]):
+        return {"fieldId": field["id"], "queued": False, "reason": "history_exists"}
+
+    out = enqueue_backfill(
+        field_id=field["id"],
+        days=KEEP_DAYS,
+        mode=mode,
+        radius_miles=radius_miles,
+    )
+    return {"fieldId": field["id"], "queued": True, "result": out}
+
+
 def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
     db = get_db()
     fields = load_active_fields_for_batch()
@@ -774,9 +810,19 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
     ok = 0
     fail = 0
     failures = []
+    auto_enqueued = 0
+    auto_enqueue_fail = 0
 
     for field in fields:
         try:
+            try:
+                auto = maybe_auto_enqueue_backfill(field, mode, radius_miles)
+                if auto.get("queued"):
+                    auto_enqueued += 1
+            except Exception as e:
+                auto_enqueue_fail += 1
+                print(f"[AutoEnqueue] failed for {field['id']}: {e}")
+
             result = build_single_result(da, field["lat"], field["lng"]) if mode == "single" else build_weighted_result(da, field["lat"], field["lng"], radius_miles)
             parent_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field["id"])
             hour_id = hour_doc_id_from_iso(meta["fileTimestampUtc"])
@@ -796,6 +842,8 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
         "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
         "fileTimestampUtc": meta["fileTimestampUtc"],
         "cacheHit": meta["cacheHit"],
+        "autoEnqueuedBackfills": auto_enqueued,
+        "autoEnqueueFailures": auto_enqueue_fail,
         "failures": failures[:25],
     }
 

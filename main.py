@@ -28,6 +28,7 @@ MAX_BULK_POINTS = 1000
 WEATHER_CACHE_COLLECTION = os.environ.get("FV_WEATHER_CACHE_COLLECTION", "field_weather_cache")
 FIELDS_COLLECTION = os.environ.get("FV_FIELDS_COLLECTION", "fields")
 MRMS_HOURLY_SUBCOLLECTION = os.environ.get("FV_MRMS_HOURLY_SUBCOLLECTION", "mrms_hourly")
+MRMS_BACKFILL_QUEUE_COLLECTION = os.environ.get("FV_MRMS_BACKFILL_QUEUE_COLLECTION", "mrms_backfill_queue")
 APP_TIMEZONE = os.environ.get("FV_TIMEZONE", "America/Chicago")
 
 KEEP_DAYS = 30
@@ -156,10 +157,7 @@ def iso_utc(dt):
 
 
 def hour_doc_id_from_iso(file_timestamp_utc):
-    return (
-        file_timestamp_utc.replace("-", "")
-        .replace(":", "")
-    )
+    return file_timestamp_utc.replace("-", "").replace(":", "")
 
 
 def list_latest_key(region, product, now_utc, max_age_hours=12):
@@ -584,9 +582,7 @@ def get_field_by_id(field_id):
 
 
 def extract_rain_value(mode, result):
-    if mode == "single":
-        return result["hourlyRainInches"]
-    return result["weightedHourlyRainInches"]
+    return result["hourlyRainInches"] if mode == "single" else result["weightedHourlyRainInches"]
 
 
 def build_hour_history_entry(meta, mode, radius_miles, result):
@@ -645,15 +641,12 @@ def build_latest_payload(field, meta, mode, radius_miles, result, last24, daily3
         latest["successfulPointCount"] = result["successfulPointCount"]
         latest["samples"] = result["samples"]
 
-    payload = {
+    return {
         "fieldId": field["id"],
         "fieldName": field.get("name") or None,
         "farmId": field.get("farmId"),
         "farmName": field.get("farmName"),
-        "location": {
-            "lat": field["lat"],
-            "lng": field["lng"],
-        },
+        "location": {"lat": field["lat"], "lng": field["lng"]},
         "mrmsHourlyLatest": latest,
         "mrmsHourlyLast24": last24,
         "mrmsDailySeries30d": daily30,
@@ -668,8 +661,6 @@ def build_latest_payload(field, meta, mode, radius_miles, result, last24, daily3
         },
         "mrmsLastUpdatedAt": firestore.SERVER_TIMESTAMP,
     }
-
-    return payload
 
 
 def rebuild_last24_and_daily30(field_id):
@@ -726,26 +717,20 @@ def rebuild_last24_and_daily30(field_id):
 
         bucket = daily_map.get(local_date)
         if bucket is None:
-            bucket = {
-                "dateISO": local_date,
-                "rainIn": 0.0,
-                "hoursCount": 0,
-            }
+            bucket = {"dateISO": local_date, "rainIn": 0.0, "hoursCount": 0}
             daily_map[local_date] = bucket
 
         bucket["rainIn"] += float(row["rainInches"] or 0.0)
         bucket["hoursCount"] += 1
 
-    daily30 = []
-    for date_iso in sorted(daily_map.keys()):
-        d = daily_map[date_iso]
-        daily30.append({
-            "dateISO": d["dateISO"],
-            "rainIn": round_num(d["rainIn"], 4),
-            "hoursCount": d["hoursCount"],
-        })
-
-    daily30 = daily30[-KEEP_DAYS:]
+    daily30 = [
+        {
+            "dateISO": v["dateISO"],
+            "rainIn": round_num(v["rainIn"], 4),
+            "hoursCount": v["hoursCount"],
+        }
+        for k, v in sorted(daily_map.items())
+    ][-KEEP_DAYS:]
 
     return last24, daily30
 
@@ -765,7 +750,6 @@ def write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, resu
         last24=last24,
         daily30=daily30,
     )
-
     parent_ref.set(parent_payload, merge=True)
 
 
@@ -788,25 +772,15 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
 
     for field in fields:
         try:
-            if mode == "single":
-                result = build_single_result(da, field["lat"], field["lng"])
-            else:
-                result = build_weighted_result(da, field["lat"], field["lng"], radius_miles)
-
+            result = build_single_result(da, field["lat"], field["lng"]) if mode == "single" else build_weighted_result(da, field["lat"], field["lng"], radius_miles)
             parent_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field["id"])
             hour_id = hour_doc_id_from_iso(meta["fileTimestampUtc"])
             hour_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION).document(hour_id)
-
             write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, result)
             ok += 1
-
         except Exception as e:
             fail += 1
-            failures.append({
-                "fieldId": field["id"],
-                "fieldName": field.get("name"),
-                "error": str(e),
-            })
+            failures.append({"fieldId": field["id"], "fieldName": field.get("name"), "error": str(e)})
 
     return {
         "total": total,
@@ -823,7 +797,6 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
 
 def backfill_field(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
     db = get_db()
-
     field = get_field_by_id(field_id)
     if not field:
         raise RuntimeError("Field not found")
@@ -856,26 +829,18 @@ def backfill_field(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADI
         try:
             meta = get_dataset_for_key_uncached(product, s3_key)
             meta["checkedProducts"] = checked
-
             da = meta["dataArray"]
-            if mode == "single":
-                result = build_single_result(da, field["lat"], field["lng"])
-            else:
-                result = build_weighted_result(da, field["lat"], field["lng"], radius_miles)
+
+            result = build_single_result(da, field["lat"], field["lng"]) if mode == "single" else build_weighted_result(da, field["lat"], field["lng"], radius_miles)
 
             hour_id = hour_doc_id_from_iso(meta["fileTimestampUtc"])
             hour_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION).document(hour_id)
-
             history_entry = build_hour_history_entry(meta, mode, radius_miles, result)
             hour_ref.set(history_entry, merge=True)
             ok += 1
-
         except Exception as e:
             fail += 1
-            failures.append({
-                "targetHourUtc": iso_utc(target_dt),
-                "error": str(e),
-            })
+            failures.append({"targetHourUtc": iso_utc(target_dt), "error": str(e)})
 
     latest_docs = list(
         parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
@@ -895,7 +860,6 @@ def backfill_field(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADI
             "io": None,
             "checkedProducts": None,
         }
-
         latest_result = {
             "weightedHourlyRainInches": latest_doc.get("rainInches"),
             "attemptedPointCount": latest_doc.get("attemptedPointCount"),
@@ -934,6 +898,142 @@ def backfill_field(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADI
     }
 
 
+def enqueue_backfill(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
+    db = get_db()
+    field = get_field_by_id(field_id)
+    if not field:
+        raise RuntimeError("Field not found")
+
+    days = int(clamp(days, 1, 30))
+    if mode not in {"single", "weighted"}:
+        raise RuntimeError("mode must be 'single' or 'weighted'")
+    if radius_miles <= 0:
+        raise RuntimeError("radiusMiles must be > 0")
+
+    ref = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION).document(field_id)
+    ref.set({
+        "fieldId": field_id,
+        "fieldName": field.get("name"),
+        "status": "queued",
+        "days": days,
+        "mode": mode,
+        "radiusMiles": radius_miles,
+        "createdAt": firestore.SERVER_TIMESTAMP,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+        "startedAt": None,
+        "finishedAt": None,
+        "error": None,
+        "attempts": firestore.Increment(1),
+    }, merge=True)
+
+    return {
+        "fieldId": field_id,
+        "fieldName": field.get("name"),
+        "status": "queued",
+        "days": days,
+        "mode": mode,
+        "radiusMiles": radius_miles,
+    }
+
+
+def claim_next_backfill():
+    db = get_db()
+    queue_ref = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION)
+    candidates = list(
+        queue_ref.where("status", "==", "queued")
+        .order_by("createdAt")
+        .limit(1)
+        .stream()
+    )
+
+    if not candidates:
+        return None, None
+
+    doc = candidates[0]
+    ref = doc.reference
+    claimed = {"ok": False}
+
+    @firestore.transactional
+    def txn_claim(transaction, doc_ref):
+        snap = doc_ref.get(transaction=transaction)
+        if not snap.exists:
+            return None
+        d = snap.to_dict() or {}
+        if d.get("status") != "queued":
+            return None
+        transaction.set(doc_ref, {
+            "status": "running",
+            "startedAt": firestore.SERVER_TIMESTAMP,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "error": None,
+        }, merge=True)
+        return d
+
+    transaction = db.transaction()
+    claimed_doc = txn_claim(transaction, ref)
+    if not claimed_doc:
+        return None, None
+
+    return ref, claimed_doc
+
+
+def process_next_backfill():
+    ref, queued = claim_next_backfill()
+    if not ref:
+        return {"processed": False, "message": "No queued backfill jobs found"}
+
+    field_id = queued.get("fieldId")
+    days = int(clamp(queued.get("days") or 30, 1, 30))
+    mode = str(queued.get("mode") or "weighted").strip().lower()
+    radius_miles = num(queued.get("radiusMiles")) or DEFAULT_RADIUS_MILES
+
+    try:
+        result = backfill_field(field_id=field_id, days=days, mode=mode, radius_miles=radius_miles)
+        ref.set({
+            "status": "done",
+            "finishedAt": firestore.SERVER_TIMESTAMP,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "resultSummary": {
+                "okHours": result["ok"],
+                "skippedNoFile": result["skippedNoFile"],
+                "failHours": result["fail"],
+            },
+            "error": None,
+        }, merge=True)
+        return {"processed": True, "queueStatus": "done", "result": result}
+    except Exception as e:
+        ref.set({
+            "status": "failed",
+            "finishedAt": firestore.SERVER_TIMESTAMP,
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "error": str(e),
+        }, merge=True)
+        return {"processed": True, "queueStatus": "failed", "error": str(e), "fieldId": field_id}
+
+
+def queue_status(limit=50):
+    db = get_db()
+    docs = list(
+        db.collection(MRMS_BACKFILL_QUEUE_COLLECTION)
+        .order_by("createdAt", direction=firestore.Query.DESCENDING)
+        .limit(limit)
+        .stream()
+    )
+    rows = []
+    for doc in docs:
+        d = doc.to_dict() or {}
+        rows.append({
+            "fieldId": d.get("fieldId") or doc.id,
+            "fieldName": d.get("fieldName"),
+            "status": d.get("status"),
+            "days": d.get("days"),
+            "mode": d.get("mode"),
+            "radiusMiles": d.get("radiusMiles"),
+            "error": d.get("error"),
+        })
+    return rows
+
+
 @app.get("/")
 def root():
     return jsonify({
@@ -942,15 +1042,15 @@ def root():
         "productPriority": PRODUCT_PRIORITY,
         "writesToCollection": WEATHER_CACHE_COLLECTION,
         "historySubcollection": MRMS_HOURLY_SUBCOLLECTION,
-        "latestField": "mrmsHourlyLatest",
-        "last24Field": "mrmsHourlyLast24",
-        "daily30Field": "mrmsDailySeries30d",
+        "queueCollection": MRMS_BACKFILL_QUEUE_COLLECTION,
         "routes": {
             "single": "/api/mrms-1h?lat=39.7898&lon=-91.2059",
             "weighted": "/api/mrms-1h?lat=39.7898&lon=-91.2059&radiusMiles=0.5&mode=weighted",
-            "bulkGet": "/api/mrms-bulk?points=39.7898,-91.2059;39.8050,-91.1800&mode=weighted&radiusMiles=0.5",
             "runBatchCache": "/run?mode=weighted&radiusMiles=0.5",
             "backfillField": "/backfill-field?fieldId=YOUR_FIELD_ID&days=30&mode=weighted&radiusMiles=0.5",
+            "enqueueBackfill": "/enqueue-backfill?fieldId=YOUR_FIELD_ID&days=30&mode=weighted&radiusMiles=0.5",
+            "processNextBackfill": "/process-next-backfill",
+            "queueStatus": "/queue-status",
         },
     })
 
@@ -972,11 +1072,7 @@ def api_mrms_1h():
 
         meta = get_cached_dataset()
         da = meta["dataArray"]
-
-        if mode == "single":
-            result = build_single_result(da, lat, lon)
-        else:
-            result = build_weighted_result(da, lat, lon, radius_miles)
+        result = build_single_result(da, lat, lon) if mode == "single" else build_weighted_result(da, lat, lon, radius_miles)
 
         return jsonify({
             "ok": True,
@@ -992,12 +1088,8 @@ def api_mrms_1h():
             "io": meta["io"],
             "result": result,
         })
-
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e),
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.get("/api/mrms-bulk")
@@ -1025,17 +1117,9 @@ def api_mrms_bulk_get():
 
         for idx, p in enumerate(points):
             validate_point(p["lat"], p["lon"])
-            if mode == "single":
-                result = build_single_result(da, p["lat"], p["lon"])
-                total_grid_samples += 1
-            else:
-                result = build_weighted_result(da, p["lat"], p["lon"], radius_miles)
-                total_grid_samples += 6
-
-            results.append({
-                "index": idx,
-                **result,
-            })
+            result = build_single_result(da, p["lat"], p["lon"]) if mode == "single" else build_weighted_result(da, p["lat"], p["lon"], radius_miles)
+            total_grid_samples += 1 if mode == "single" else 6
+            results.append({"index": idx, **result})
 
         return jsonify({
             "ok": True,
@@ -1053,12 +1137,8 @@ def api_mrms_bulk_get():
             "totalGridSamples": total_grid_samples,
             "results": results,
         })
-
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e),
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.get("/run")
@@ -1066,26 +1146,17 @@ def run_batch():
     try:
         mode = (request.args.get("mode") or "weighted").strip().lower()
         radius_miles = num(request.args.get("radiusMiles")) or DEFAULT_RADIUS_MILES
-
         out = run_batch_cache(mode=mode, radius_miles=radius_miles)
-
         return jsonify({
             "ok": True,
             "mode": mode,
             "radiusMiles": radius_miles if mode == "weighted" else None,
             "writesToCollection": WEATHER_CACHE_COLLECTION,
             "historySubcollection": MRMS_HOURLY_SUBCOLLECTION,
-            "latestField": "mrmsHourlyLatest",
-            "last24Field": "mrmsHourlyLast24",
-            "daily30Field": "mrmsDailySeries30d",
             "result": out,
         })
-
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e),
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 @app.get("/backfill-field")
@@ -1099,25 +1170,46 @@ def backfill_field_route():
         if not field_id:
             return jsonify({"ok": False, "error": "Missing fieldId"}), 400
 
-        out = backfill_field(
-            field_id=field_id,
-            days=days,
-            mode=mode,
-            radius_miles=radius_miles,
-        )
-
-        return jsonify({
-            "ok": True,
-            "mode": mode,
-            "radiusMiles": radius_miles if mode == "weighted" else None,
-            "result": out,
-        })
-
+        out = backfill_field(field_id=field_id, days=days, mode=mode, radius_miles=radius_miles)
+        return jsonify({"ok": True, "mode": mode, "radiusMiles": radius_miles if mode == "weighted" else None, "result": out})
     except Exception as e:
-        return jsonify({
-            "ok": False,
-            "error": str(e),
-        }), 500
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/enqueue-backfill")
+def enqueue_backfill_route():
+    try:
+        field_id = str(request.args.get("fieldId") or "").strip()
+        days = int(clamp(request.args.get("days") or 30, 1, 30))
+        mode = (request.args.get("mode") or "weighted").strip().lower()
+        radius_miles = num(request.args.get("radiusMiles")) or DEFAULT_RADIUS_MILES
+
+        if not field_id:
+            return jsonify({"ok": False, "error": "Missing fieldId"}), 400
+
+        out = enqueue_backfill(field_id=field_id, days=days, mode=mode, radius_miles=radius_miles)
+        return jsonify({"ok": True, "result": out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/process-next-backfill")
+def process_next_backfill_route():
+    try:
+        out = process_next_backfill()
+        return jsonify({"ok": True, "result": out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
+
+
+@app.get("/queue-status")
+def queue_status_route():
+    try:
+        limit = int(clamp(request.args.get("limit") or 50, 1, 200))
+        out = queue_status(limit=limit)
+        return jsonify({"ok": True, "queueCollection": MRMS_BACKFILL_QUEUE_COLLECTION, "items": out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e)}), 500
 
 
 if __name__ == "__main__":

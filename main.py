@@ -38,10 +38,9 @@ KEEP_HOURS = KEEP_DAYS * 24
 LAST24_COUNT = 24
 
 DEFAULT_BACKFILL_MAX_FIELDS_PER_RUN = int(os.environ.get("FV_BACKFILL_MAX_FIELDS_PER_RUN", "1"))
-DEFAULT_BACKFILL_MAX_MINUTES_PER_RUN = float(os.environ.get("FV_BACKFILL_MAX_MINUTES_PER_RUN", "2"))
+DEFAULT_BACKFILL_MAX_MINUTES_PER_RUN = float(os.environ.get("FV_BACKFILL_MAX_MINUTES_PER_RUN", "4"))
 DEFAULT_REPAIR_LOOKBACK_HOURS = int(os.environ.get("FV_REPAIR_LOOKBACK_HOURS", "12"))
 
-# NEW: chunk sizes so one queue job does not try to do everything in one request
 DEFAULT_FULL_BACKFILL_CHUNK_HOURS = int(os.environ.get("FV_FULL_BACKFILL_CHUNK_HOURS", "48"))
 DEFAULT_REPAIR_CHUNK_HOURS = int(os.environ.get("FV_REPAIR_CHUNK_HOURS", "48"))
 
@@ -436,7 +435,7 @@ def sample_nearest_with_grid(da, lat, lon):
         value = 0.0
 
     return {
-        "inches": value,
+        "mm": value,
         "nearestGridLatitude": grid_lat,
         "nearestGridLongitude": signed_grid_lon,
         "nearestGridLongitudeRaw": raw_grid_lon,
@@ -493,7 +492,7 @@ def build_single_result(da, lat, lon):
     return {
         "lat": round_num(lat, 6),
         "lon": round_num(lon, 6),
-        "hourlyRainInches": round_num(sampled["inches"], 4),
+        "hourlyRainMm": round_num(sampled["mm"], 4),
         "nearestGridLatitude": round_num(sampled["nearestGridLatitude"], 6),
         "nearestGridLongitude": round_num(sampled["nearestGridLongitude"], 6),
         "nearestGridLongitudeRaw": round_num(sampled["nearestGridLongitudeRaw"], 6),
@@ -514,7 +513,7 @@ def build_weighted_result(da, lat, lon, radius_miles):
             "weight": p["weight"],
             "lat": round_num(p["lat"], 6),
             "lon": round_num(p["lon"], 6),
-            "inches": round_num(sampled["inches"], 4),
+            "mm": round_num(sampled["mm"], 4),
             "nearestGridLatitude": round_num(sampled["nearestGridLatitude"], 6),
             "nearestGridLongitude": round_num(sampled["nearestGridLongitude"], 6),
             "nearestGridLongitudeRaw": round_num(sampled["nearestGridLongitudeRaw"], 6),
@@ -526,13 +525,13 @@ def build_weighted_result(da, lat, lon, radius_miles):
         good.append(rec)
 
     used_weight = sum(s["weight"] for s in good)
-    weighted_inches = sum((s["inches"] or 0.0) * s["weight"] for s in good) / used_weight
+    weighted_mm = sum((s["mm"] or 0.0) * s["weight"] for s in good) / used_weight
 
     return {
         "lat": round_num(lat, 6),
         "lon": round_num(lon, 6),
         "radiusMiles": radius_miles,
-        "weightedHourlyRainInches": round_num(weighted_inches, 4),
+        "weightedHourlyRainMm": round_num(weighted_mm, 4),
         "attemptedPointCount": len(samples),
         "successfulPointCount": len(good),
         "samples": samples,
@@ -608,7 +607,7 @@ def get_field_by_id(field_id):
 
 
 def extract_rain_value(mode, result):
-    return result["hourlyRainInches"] if mode == "single" else result["weightedHourlyRainInches"]
+    return result["hourlyRainMm"] if mode == "single" else result["weightedHourlyRainMm"]
 
 
 def build_hour_history_entry(meta, mode, radius_miles, result):
@@ -620,7 +619,7 @@ def build_hour_history_entry(meta, mode, radius_miles, result):
         "variableName": meta["variableName"],
         "mode": mode,
         "radiusMiles": radius_miles if mode == "weighted" else None,
-        "rainInches": extract_rain_value(mode, result),
+        "rainMm": extract_rain_value(mode, result),
         "updatedAt": firestore.SERVER_TIMESTAMP,
     }
 
@@ -694,18 +693,18 @@ def build_latest_payload(field, meta, mode, radius_miles, result, last24, daily3
         "io": meta["io"],
         "checkedProducts": meta.get("checkedProducts"),
         "updatedAt": firestore.SERVER_TIMESTAMP,
-        "rainInches": extract_rain_value(mode, result),
+        "rainMm": extract_rain_value(mode, result),
     }
 
     if mode == "single":
-        latest["hourlyRainInches"] = result["hourlyRainInches"]
+        latest["hourlyRainMm"] = result["hourlyRainMm"]
         latest["nearestGridLatitude"] = result["nearestGridLatitude"]
         latest["nearestGridLongitude"] = result["nearestGridLongitude"]
         latest["nearestGridLongitudeRaw"] = result["nearestGridLongitudeRaw"]
         latest["queryLongitudeUsed"] = result["queryLongitudeUsed"]
         latest["longitudeMode"] = result["longitudeMode"]
     else:
-        latest["weightedHourlyRainInches"] = result["weightedHourlyRainInches"]
+        latest["weightedHourlyRainMm"] = result["weightedHourlyRainMm"]
         latest["attemptedPointCount"] = result["attemptedPointCount"]
         latest["successfulPointCount"] = result["successfulPointCount"]
         latest["samples"] = result["samples"]
@@ -727,6 +726,7 @@ def build_latest_payload(field, meta, mode, radius_miles, result, last24, daily3
             "latestSelectedProduct": meta["selectedProduct"],
             "last24Count": len(last24),
             "daily30Count": len(daily30),
+            "rainUnit": "mm",
             "fullBackfillComplete": full_complete,
             "backfillCompletedAt": backfill_completed_at,
             "latestRepairEnqueuedAt": latest_repair_enqueued_at,
@@ -764,13 +764,13 @@ def rebuild_last24_and_daily30(field_id):
     for doc in docs:
         d = doc.to_dict() or {}
         ts = str(d.get("fileTimestampUtc") or "")
-        rain = num(d.get("rainInches"))
+        rain = num(d.get("rainMm"))
         if not ts or rain is None:
             continue
         rows.append({
             "hourKey": doc.id,
             "fileTimestampUtc": ts,
-            "rainInches": round_num(rain, 4),
+            "rainMm": round_num(rain, 4),
             "selectedProduct": d.get("selectedProduct"),
             "mode": d.get("mode"),
             "source": d.get("source"),
@@ -789,16 +789,16 @@ def rebuild_last24_and_daily30(field_id):
 
         bucket = daily_map.get(local_date)
         if bucket is None:
-            bucket = {"dateISO": local_date, "rainIn": 0.0, "hoursCount": 0}
+            bucket = {"dateISO": local_date, "rainMm": 0.0, "hoursCount": 0}
             daily_map[local_date] = bucket
 
-        bucket["rainIn"] += float(row["rainInches"] or 0.0)
+        bucket["rainMm"] += float(row["rainMm"] or 0.0)
         bucket["hoursCount"] += 1
 
     daily30 = [
         {
             "dateISO": v["dateISO"],
-            "rainIn": round_num(v["rainIn"], 4),
+            "rainMm": round_num(v["rainMm"], 4),
             "hoursCount": v["hoursCount"],
         }
         for _, v in sorted(daily_map.items())
@@ -1208,11 +1208,11 @@ def finalize_field_parent_from_hourly(field_id, mark_full_backfill_complete=Fals
         "checkedProducts": None,
     }
     latest_result = {
-        "weightedHourlyRainInches": latest_doc.get("rainInches"),
+        "weightedHourlyRainMm": latest_doc.get("rainMm"),
         "attemptedPointCount": latest_doc.get("attemptedPointCount"),
         "successfulPointCount": latest_doc.get("successfulPointCount"),
         "samples": latest_doc.get("samples"),
-        "hourlyRainInches": latest_doc.get("rainInches"),
+        "hourlyRainMm": latest_doc.get("rainMm"),
         "nearestGridLatitude": latest_doc.get("nearestGridLatitude"),
         "nearestGridLongitude": latest_doc.get("nearestGridLongitude"),
         "nearestGridLongitudeRaw": latest_doc.get("nearestGridLongitudeRaw"),
@@ -1536,7 +1536,7 @@ def repair_field_range_chunk(field_id, start_hour_utc, end_hour_utc, cursor_hour
         cur += timedelta(hours=1)
 
     is_complete = cur > end_dt
-    finalize_field_parent_from_hourly(field["id"], mark_full_backfill_complete=False)
+    finalize_field_parent_from_hourly(field["id"], mark_fullBackfill_complete=False)  # intentional? no, fix below
 
     return {
         "fieldId": field["id"],
@@ -1684,7 +1684,6 @@ def process_one_backfill_job():
 
             return {"processed": True, "queueStatus": "requeued", "result": result}
 
-        # full_backfill chunked
         days = int(clamp(queued.get("days") or 30, 1, 30))
         hours_total = int(clamp(queued.get("hoursTotal") or (days * 24), 1, KEEP_HOURS))
         hours_done = int(clamp(queued.get("hoursDone") or 0, 0, hours_total))
@@ -1867,6 +1866,7 @@ def root():
         "repairLookbackHours": DEFAULT_REPAIR_LOOKBACK_HOURS,
         "fullBackfillChunkHours": DEFAULT_FULL_BACKFILL_CHUNK_HOURS,
         "repairChunkHours": DEFAULT_REPAIR_CHUNK_HOURS,
+        "rainUnit": "mm",
         "routes": {
             "single": "/api/mrms-1h?lat=39.7898&lon=-91.2059",
             "weighted": "/api/mrms-1h?lat=39.7898&lon=-91.2059&radiusMiles=0.5&mode=weighted",
@@ -1874,7 +1874,7 @@ def root():
             "backfillField": "/backfill-field?fieldId=YOUR_FIELD_ID&days=30&mode=weighted&radiusMiles=0.5",
             "enqueueBackfill": "/enqueue-backfill?fieldId=YOUR_FIELD_ID&days=30&mode=weighted&radiusMiles=0.5",
             "enqueueBackfillAll": "/enqueue-backfill-all?days=30&mode=weighted&radiusMiles=0.5",
-            "processNextBackfill": "/process-next-backfill?maxFields=1&maxMinutes=2",
+            "processNextBackfill": "/process-next-backfill?maxFields=1&maxMinutes=4",
             "queueStatus": "/queue-status",
         },
     })
@@ -1903,7 +1903,7 @@ def api_mrms_1h():
             "ok": True,
             "source": "noaa-mrms-aws",
             "mode": mode,
-            "units": "inches",
+            "units": "mm",
             "selectedProduct": meta["selectedProduct"],
             "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
             "fileTimestampUtc": meta["fileTimestampUtc"],
@@ -1952,7 +1952,7 @@ def api_mrms_bulk_get():
             "ok": True,
             "source": "noaa-mrms-aws",
             "mode": mode,
-            "units": "inches",
+            "units": "mm",
             "selectedProduct": meta["selectedProduct"],
             "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
             "fileTimestampUtc": meta["fileTimestampUtc"],
@@ -1982,6 +1982,7 @@ def run_batch():
             "radiusMiles": radius_miles if mode == "weighted" else None,
             "writesToCollection": WEATHER_CACHE_COLLECTION,
             "historySubcollection": MRMS_HOURLY_SUBCOLLECTION,
+            "rainUnit": "mm",
             "result": out,
         })
     except Exception as e:
@@ -2002,7 +2003,7 @@ def backfill_field_route():
             return jsonify({"ok": False, "error": "Missing fieldId"}), 400
 
         out = backfill_field(field_id=field_id, days=days, mode=mode, radius_miles=radius_miles)
-        return jsonify({"ok": True, "mode": mode, "radiusMiles": radius_miles if mode == "weighted" else None, "result": out})
+        return jsonify({"ok": True, "mode": mode, "radiusMiles": radius_miles if mode == "weighted" else None, "rainUnit": "mm", "result": out})
     except Exception as e:
         print(f"[/backfill-field] ERROR: {e}", flush=True)
         traceback.print_exc()

@@ -1362,15 +1362,27 @@ def repair_field_range(field_id, start_hour_utc, end_hour_utc, mode="weighted", 
 def claim_next_backfill():
     db = get_db()
     queue_ref = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION)
+
+    # Simpler query: only filter queued docs, avoid compound order issue
     candidates = list(
-        queue_ref.where("status", "==", "queued")
-        .order_by("createdAt")
-        .limit(1)
-        .stream()
+        queue_ref.where("status", "==", "queued").limit(25).stream()
     )
 
     if not candidates:
         return None, None
+
+    # Sort in Python so we still prefer oldest created job
+    def sort_key(doc):
+        d = doc.to_dict() or {}
+        created = d.get("createdAt")
+        if created is None:
+            return datetime.max.replace(tzinfo=timezone.utc)
+        try:
+            return created if isinstance(created, datetime) else created.datetime.replace(tzinfo=timezone.utc)
+        except Exception:
+            return datetime.max.replace(tzinfo=timezone.utc)
+
+    candidates.sort(key=sort_key)
 
     doc = candidates[0]
     ref = doc.reference
@@ -1381,8 +1393,9 @@ def claim_next_backfill():
         if not snap.exists:
             return None
         d = snap.to_dict() or {}
-        if d.get("status") != "queued":
+        if str(d.get("status") or "").strip().lower() != "queued":
             return None
+
         transaction.set(doc_ref, {
             "status": "running",
             "startedAt": firestore.SERVER_TIMESTAMP,
@@ -1720,7 +1733,6 @@ def enqueue_backfill_all_route():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-
 @app.get("/process-next-backfill")
 def process_next_backfill_route():
     try:
@@ -1729,7 +1741,9 @@ def process_next_backfill_route():
         out = process_next_backfill(max_fields=max_fields, max_minutes=max_minutes)
         return jsonify({"ok": True, "result": out})
     except Exception as e:
+        print(f"[process-next-backfill] ERROR: {e}", flush=True)
         return jsonify({"ok": False, "error": str(e)}), 500
+
 
 
 @app.get("/queue-status")

@@ -42,8 +42,8 @@ DEFAULT_BACKFILL_MAX_MINUTES_PER_RUN = float(os.environ.get("FV_BACKFILL_MAX_MIN
 DEFAULT_REPAIR_LOOKBACK_HOURS = int(os.environ.get("FV_REPAIR_LOOKBACK_HOURS", "12"))
 
 # NEW: chunk sizes so one queue job does not try to do everything in one request
-DEFAULT_FULL_BACKFILL_CHUNK_HOURS = int(os.environ.get("FV_FULL_BACKFILL_CHUNK_HOURS", "24"))
-DEFAULT_REPAIR_CHUNK_HOURS = int(os.environ.get("FV_REPAIR_CHUNK_HOURS", "24"))
+DEFAULT_FULL_BACKFILL_CHUNK_HOURS = int(os.environ.get("FV_FULL_BACKFILL_CHUNK_HOURS", "48"))
+DEFAULT_REPAIR_CHUNK_HOURS = int(os.environ.get("FV_REPAIR_CHUNK_HOURS", "48"))
 
 PRODUCT_PRIORITY = [
     "MultiSensor_QPE_01H_Pass2_00.00",

@@ -27,7 +27,7 @@ DEFAULT_REGION = "CONUS"
 DEFAULT_RADIUS_MILES = 0.5
 MAX_BULK_POINTS = 1000
 
-WEATHER_CACHE_COLLECTION = os.environ.get("FV_WEATHER_CACHE_COLLECTION", "field_weather_cache")
+MRMS_PARENT_COLLECTION = os.environ.get("FV_MRMS_PARENT_COLLECTION", "field_mrms_weather")
 FIELDS_COLLECTION = os.environ.get("FV_FIELDS_COLLECTION", "fields")
 MRMS_HOURLY_SUBCOLLECTION = os.environ.get("FV_MRMS_HOURLY_SUBCOLLECTION", "mrms_hourly")
 MRMS_BACKFILL_QUEUE_COLLECTION = os.environ.get("FV_MRMS_BACKFILL_QUEUE_COLLECTION", "mrms_backfill_queue")
@@ -610,6 +610,13 @@ def extract_rain_value(mode, result):
     return result["hourlyRainMm"] if mode == "single" else result["weightedHourlyRainMm"]
 
 
+def get_doc_rain_mm(doc_dict):
+    rain = num(doc_dict.get("rainMm"))
+    if rain is not None:
+        return rain
+    return num(doc_dict.get("rainInches"))
+
+
 def build_hour_history_entry(meta, mode, radius_miles, result):
     entry = {
         "source": "noaa-mrms-aws",
@@ -639,7 +646,7 @@ def build_hour_history_entry(meta, mode, radius_miles, result):
 
 def get_field_mrms_state(field_id):
     db = get_db()
-    parent_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field_id)
+    parent_ref = db.collection(MRMS_PARENT_COLLECTION).document(field_id)
     snap = parent_ref.get()
 
     if not snap.exists:
@@ -722,11 +729,11 @@ def build_latest_payload(field, meta, mode, radius_miles, result, last24, daily3
             "subcollection": MRMS_HOURLY_SUBCOLLECTION,
             "keepDays": KEEP_DAYS,
             "keepHours": KEEP_HOURS,
+            "units": "mm",
             "latestFileTimestampUtc": meta["fileTimestampUtc"],
             "latestSelectedProduct": meta["selectedProduct"],
             "last24Count": len(last24),
             "daily30Count": len(daily30),
-            "rainUnit": "mm",
             "fullBackfillComplete": full_complete,
             "backfillCompletedAt": backfill_completed_at,
             "latestRepairEnqueuedAt": latest_repair_enqueued_at,
@@ -739,7 +746,7 @@ def rebuild_last24_and_daily30(field_id):
     db = get_db()
     tz = get_app_tz()
 
-    parent_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field_id)
+    parent_ref = db.collection(MRMS_PARENT_COLLECTION).document(field_id)
     hourly_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
 
     cutoff_dt = datetime.now(timezone.utc) - timedelta(days=KEEP_DAYS)
@@ -764,13 +771,13 @@ def rebuild_last24_and_daily30(field_id):
     for doc in docs:
         d = doc.to_dict() or {}
         ts = str(d.get("fileTimestampUtc") or "")
-        rain = num(d.get("rainMm"))
-        if not ts or rain is None:
+        rain_mm = get_doc_rain_mm(d)
+        if not ts or rain_mm is None:
             continue
         rows.append({
             "hourKey": doc.id,
             "fileTimestampUtc": ts,
-            "rainMm": round_num(rain, 4),
+            "rainMm": round_num(rain_mm, 4),
             "selectedProduct": d.get("selectedProduct"),
             "mode": d.get("mode"),
             "source": d.get("source"),
@@ -958,7 +965,7 @@ def enqueue_gap_repair(field_id, start_hour_utc, end_hour_utc, mode="weighted", 
         "lastChunkSummary": None,
     }, merge=True)
 
-    parent_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field_id)
+    parent_ref = db.collection(MRMS_PARENT_COLLECTION).document(field_id)
     parent_ref.set({
         "mrmsHistoryMeta": {
             "latestRepairEnqueuedAt": firestore.SERVER_TIMESTAMP
@@ -1034,7 +1041,7 @@ def maybe_auto_enqueue_backfill(field, mode, radius_miles):
 
 def find_missing_recent_hours(field_id, latest_hour_utc, lookback_hours):
     db = get_db()
-    parent_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field_id)
+    parent_ref = db.collection(MRMS_PARENT_COLLECTION).document(field_id)
     hourly_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
 
     latest_dt = floor_to_hour_utc(parse_iso_utc(latest_hour_utc))
@@ -1129,7 +1136,7 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
 
             result = build_single_result(da, field["lat"], field["lng"]) if mode == "single" else build_weighted_result(da, field["lat"], field["lng"], radius_miles)
 
-            parent_ref = get_db().collection(WEATHER_CACHE_COLLECTION).document(field["id"])
+            parent_ref = get_db().collection(MRMS_PARENT_COLLECTION).document(field["id"])
             hour_id = hour_doc_id_from_iso(meta["fileTimestampUtc"])
             hour_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION).document(hour_id)
             write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, result)
@@ -1160,7 +1167,7 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
         "total": total,
         "ok": ok,
         "fail": fail,
-        "collection": WEATHER_CACHE_COLLECTION,
+        "collection": MRMS_PARENT_COLLECTION,
         "selectedProduct": meta["selectedProduct"],
         "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
         "fileTimestampUtc": meta["fileTimestampUtc"],
@@ -1180,7 +1187,7 @@ def finalize_field_parent_from_hourly(field_id, mark_full_backfill_complete=Fals
         raise RuntimeError("Field not found")
 
     db = get_db()
-    parent_ref = db.collection(WEATHER_CACHE_COLLECTION).document(field["id"])
+    parent_ref = db.collection(MRMS_PARENT_COLLECTION).document(field["id"])
 
     latest_docs = list(
         parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
@@ -1198,6 +1205,8 @@ def finalize_field_parent_from_hourly(field_id, mark_full_backfill_complete=Fals
         }
 
     latest_doc = latest_docs[0].to_dict() or {}
+    latest_rain_mm = get_doc_rain_mm(latest_doc)
+
     latest_meta = {
         "selectedProduct": latest_doc.get("selectedProduct"),
         "selectedKey": latest_doc.get("selectedKey"),
@@ -1208,11 +1217,11 @@ def finalize_field_parent_from_hourly(field_id, mark_full_backfill_complete=Fals
         "checkedProducts": None,
     }
     latest_result = {
-        "weightedHourlyRainMm": latest_doc.get("rainMm"),
+        "weightedHourlyRainMm": latest_rain_mm,
         "attemptedPointCount": latest_doc.get("attemptedPointCount"),
         "successfulPointCount": latest_doc.get("successfulPointCount"),
         "samples": latest_doc.get("samples"),
-        "hourlyRainMm": latest_doc.get("rainMm"),
+        "hourlyRainMm": latest_rain_mm,
         "nearestGridLatitude": latest_doc.get("nearestGridLatitude"),
         "nearestGridLongitude": latest_doc.get("nearestGridLongitude"),
         "nearestGridLongitudeRaw": latest_doc.get("nearestGridLongitudeRaw"),
@@ -1263,7 +1272,7 @@ def backfill_field(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADI
     this_hour = floor_to_hour_utc(now_utc)
     total_hours = days * 24
 
-    parent_ref = get_db().collection(WEATHER_CACHE_COLLECTION).document(field["id"])
+    parent_ref = get_db().collection(MRMS_PARENT_COLLECTION).document(field["id"])
 
     ok = 0
     skipped = 0
@@ -1330,7 +1339,7 @@ def backfill_field_chunk(field_id, anchor_hour_utc, hours_total, hours_done, chu
     start_index = hours_done
     end_index = min(hours_total, start_index + chunk_hours)
 
-    parent_ref = get_db().collection(WEATHER_CACHE_COLLECTION).document(field["id"])
+    parent_ref = get_db().collection(MRMS_PARENT_COLLECTION).document(field["id"])
 
     ok = 0
     skipped = 0
@@ -1403,7 +1412,7 @@ def repair_field_range(field_id, start_hour_utc, end_hour_utc, mode="weighted", 
     if end_dt < start_dt:
         raise RuntimeError("endHourUtc must be >= startHourUtc")
 
-    parent_ref = get_db().collection(WEATHER_CACHE_COLLECTION).document(field["id"])
+    parent_ref = get_db().collection(MRMS_PARENT_COLLECTION).document(field["id"])
 
     ok = 0
     skipped = 0
@@ -1495,7 +1504,7 @@ def repair_field_range_chunk(field_id, start_hour_utc, end_hour_utc, cursor_hour
     chunk_hours = int(clamp(chunk_hours, 1, 168))
     processed_slots = 0
 
-    parent_ref = get_db().collection(WEATHER_CACHE_COLLECTION).document(field["id"])
+    parent_ref = get_db().collection(MRMS_PARENT_COLLECTION).document(field["id"])
 
     ok = 0
     skipped = 0
@@ -1536,7 +1545,7 @@ def repair_field_range_chunk(field_id, start_hour_utc, end_hour_utc, cursor_hour
         cur += timedelta(hours=1)
 
     is_complete = cur > end_dt
-    finalize_field_parent_from_hourly(field["id"], mark_fullBackfill_complete=False)  # intentional? no, fix below
+    finalize_field_parent_from_hourly(field["id"], mark_full_backfill_complete=False)
 
     return {
         "fieldId": field["id"],
@@ -1860,7 +1869,7 @@ def root():
         "ok": True,
         "service": "FarmVista NOAA MRMS Pass2->Pass1 fallback rainfall service",
         "productPriority": PRODUCT_PRIORITY,
-        "writesToCollection": WEATHER_CACHE_COLLECTION,
+        "writesToCollection": MRMS_PARENT_COLLECTION,
         "historySubcollection": MRMS_HOURLY_SUBCOLLECTION,
         "queueCollection": MRMS_BACKFILL_QUEUE_COLLECTION,
         "repairLookbackHours": DEFAULT_REPAIR_LOOKBACK_HOURS,
@@ -1980,7 +1989,7 @@ def run_batch():
             "ok": True,
             "mode": mode,
             "radiusMiles": radius_miles if mode == "weighted" else None,
-            "writesToCollection": WEATHER_CACHE_COLLECTION,
+            "writesToCollection": MRMS_PARENT_COLLECTION,
             "historySubcollection": MRMS_HOURLY_SUBCOLLECTION,
             "rainUnit": "mm",
             "result": out,

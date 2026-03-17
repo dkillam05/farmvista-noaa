@@ -1321,7 +1321,7 @@ def backfill_field(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADI
     }
 
 
-def backfill_field_chunk(field_id, anchor_hour_utc, hours_total, hours_done, chunk_hours, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
+def backfill_field_chunk(field_id, anchor_hour_utc, hours_total, hours_done, chunk_hours, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES, deadline_ts=None):
     field = get_field_by_id(field_id)
     if not field:
         raise RuntimeError("Field not found")
@@ -1345,13 +1345,18 @@ def backfill_field_chunk(field_id, anchor_hour_utc, hours_total, hours_done, chu
     skipped = 0
     fail = 0
     failures = []
+    processed_slots = 0
 
     for i in range(start_index, end_index):
+        if deadline_ts is not None and time.time() >= deadline_ts:
+            break
+
         target_dt = anchor_dt - timedelta(hours=i)
         product, s3_key, checked = pick_best_key_for_hour(target_dt)
 
         if not s3_key:
             skipped += 1
+            processed_slots += 1
             continue
 
         try:
@@ -1373,7 +1378,9 @@ def backfill_field_chunk(field_id, anchor_hour_utc, hours_total, hours_done, chu
                 "error": str(e),
             })
 
-    new_hours_done = end_index
+        processed_slots += 1
+
+    new_hours_done = hours_done + processed_slots
     is_complete = new_hours_done >= hours_total
 
     finalize_field_parent_from_hourly(field["id"], mark_full_backfill_complete=is_complete)
@@ -1387,7 +1394,7 @@ def backfill_field_chunk(field_id, anchor_hour_utc, hours_total, hours_done, chu
         "hoursDoneBefore": hours_done,
         "hoursDoneAfter": new_hours_done,
         "chunkHoursRequested": chunk_hours,
-        "chunkHoursProcessed": end_index - start_index,
+        "chunkHoursProcessed": processed_slots,
         "isComplete": is_complete,
         "ok": ok,
         "skippedNoFile": skipped,
@@ -1464,7 +1471,7 @@ def repair_field_range(field_id, start_hour_utc, end_hour_utc, mode="weighted", 
     }
 
 
-def repair_field_range_chunk(field_id, start_hour_utc, end_hour_utc, cursor_hour_utc=None, chunk_hours=DEFAULT_REPAIR_CHUNK_HOURS, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
+def repair_field_range_chunk(field_id, start_hour_utc, end_hour_utc, cursor_hour_utc=None, chunk_hours=DEFAULT_REPAIR_CHUNK_HOURS, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES, deadline_ts=None):
     field = get_field_by_id(field_id)
     if not field:
         raise RuntimeError("Field not found")
@@ -1514,6 +1521,9 @@ def repair_field_range_chunk(field_id, start_hour_utc, end_hour_utc, cursor_hour
     cursor_before = cur
 
     while cur <= end_dt and processed_slots < chunk_hours:
+        if deadline_ts is not None and time.time() >= deadline_ts:
+            break
+
         product, s3_key, checked = pick_best_key_for_hour(cur)
 
         if not s3_key:
@@ -1625,6 +1635,7 @@ def process_one_backfill_job():
     field_id = queued.get("fieldId")
     mode = str(queued.get("mode") or "weighted").strip().lower()
     radius_miles = num(queued.get("radiusMiles")) or DEFAULT_RADIUS_MILES
+    deadline_ts = time.time() + (DEFAULT_BACKFILL_MAX_MINUTES_PER_RUN * 60.0) - 20.0
 
     try:
         if job_type == "repair_gap":
@@ -1644,6 +1655,7 @@ def process_one_backfill_job():
                 chunk_hours=chunk_hours,
                 mode=mode,
                 radius_miles=radius_miles,
+                deadline_ts=deadline_ts,
             )
 
             if result.get("isComplete"):
@@ -1707,6 +1719,7 @@ def process_one_backfill_job():
             chunk_hours=chunk_hours,
             mode=mode,
             radius_miles=radius_miles,
+            deadline_ts=deadline_ts,
         )
 
         if result.get("isComplete"):

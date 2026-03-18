@@ -1,4 +1,4 @@
-import gzip 
+import gzip
 import math
 import os
 import tempfile
@@ -1580,25 +1580,49 @@ def claim_next_backfill():
     queue_ref = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION)
 
     candidates = list(
-        queue_ref.where("status", "==", "queued").limit(25).stream()
+        queue_ref.where("status", "==", "queued").limit(200).stream()
     )
 
     if not candidates:
         return None, None
 
-    def sort_key(doc):
-        d = doc.to_dict() or {}
-        created = d.get("createdAt")
+    def created_sort_value(doc_dict):
+        created = doc_dict.get("createdAt")
         if created is None:
             return datetime.max.replace(tzinfo=timezone.utc)
+
         try:
-            return created if isinstance(created, datetime) else created.datetime.replace(tzinfo=timezone.utc)
+            if isinstance(created, datetime):
+                return created if created.tzinfo else created.replace(tzinfo=timezone.utc)
+
+            if hasattr(created, "datetime"):
+                dt = created.datetime
+                return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
+
+            if hasattr(created, "to_datetime"):
+                dt = created.to_datetime()
+                return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
         except Exception:
-            return datetime.max.replace(tzinfo=timezone.utc)
+            pass
 
-    candidates.sort(key=sort_key)
+        return datetime.max.replace(tzinfo=timezone.utc)
 
-    doc = candidates[0]
+    def job_priority(doc_dict):
+        job_type = str(doc_dict.get("jobType") or "full_backfill").strip().lower()
+        if job_type == "full_backfill":
+            return 0
+        if job_type == "repair_gap":
+            return 1
+        return 9
+
+    enriched = []
+    for doc in candidates:
+        d = doc.to_dict() or {}
+        enriched.append((job_priority(d), created_sort_value(d), doc, d))
+
+    enriched.sort(key=lambda x: (x[0], x[1]))
+
+    doc = enriched[0][2]
     ref = doc.reference
 
     @firestore.transactional

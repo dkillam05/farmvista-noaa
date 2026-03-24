@@ -1,17 +1,20 @@
 # =====================================================================
 # main.py  (FULL FILE)
 # FarmVista NOAA MRMS Pass2->Pass1 fallback rainfall service
-# Rev: 2026-03-23b-auto-reset-on-latlng-change
+# Rev: 2026-03-24a-force-full-backfill-on-latlng-change
 #
 # PURPOSE
 # ✅ Pulls MRMS hourly rainfall from NOAA AWS
 # ✅ Writes per-field MRMS parent docs + hourly subcollection
 # ✅ Manages full backfill + gap repair queue
-# ✅ NEW: detects field lat/lng changes automatically inside MRMS
-# ✅ NEW: if lat/lng changed, clears stale MRMS history for that field
-# ✅ NEW: if lat/lng changed, force-resets full backfill queue for that field
-# ✅ NEW: writes the current hour immediately at the new location
-# ✅ NEW: treats moved fields like new fields automatically
+# ✅ Detects field lat/lng changes automatically inside MRMS
+# ✅ If lat/lng changed, clears stale MRMS history for that field
+# ✅ If lat/lng changed, force-resets full backfill queue for that field
+# ✅ Writes the current hour immediately at the new location
+# ✅ Treats moved fields like new fields automatically
+# ✅ FIX: moved fields now suppress repair-gap enqueue on the same run
+# ✅ FIX: moved fields now clear stale repair jobs for that field
+# ✅ FIX: moved fields now clear stale full-backfill job state before requeue
 #
 # NOTES
 # - This file handles MRMS automation only.
@@ -891,6 +894,31 @@ def field_needs_full_backfill(field_id):
     return not bool(state.get("fullBackfillComplete", False))
 
 
+def delete_queue_jobs_for_field(field_id):
+    db = get_db()
+    coll = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION)
+    deleted = 0
+
+    docs = list(coll.where("fieldId", "==", field_id).stream())
+    if not docs:
+        return 0
+
+    b = db.batch()
+    count = 0
+    for doc in docs:
+        b.delete(doc.reference)
+        deleted += 1
+        count += 1
+        if count >= 400:
+            b.commit()
+            b = db.batch()
+            count = 0
+    if count > 0:
+        b.commit()
+
+    return deleted
+
+
 def enqueue_backfill(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
     db = get_db()
     field = get_field_by_id(field_id)
@@ -1030,6 +1058,7 @@ def reset_field_history_for_location_change(field, mode="weighted", radius_miles
     hourly_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
 
     deleted_hours = delete_subcollection_documents(hourly_ref)
+    deleted_queue_jobs = delete_queue_jobs_for_field(field_id)
 
     parent_ref.set({
         "fieldId": field_id,
@@ -1070,6 +1099,7 @@ def reset_field_history_for_location_change(field, mode="weighted", radius_miles
         "fieldId": field_id,
         "fieldName": field.get("name"),
         "deletedHourlyDocs": deleted_hours,
+        "deletedQueueJobs": deleted_queue_jobs,
         "queueResult": queue_result,
     }
 
@@ -1328,10 +1358,13 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
 
     for field in fields:
         try:
+            location_changed_this_run = False
+
             try:
                 location_change = maybe_handle_location_change(field, mode, radius_miles)
                 if location_change.get("locationChanged"):
                     auto_location_resets += 1
+                    location_changed_this_run = True
             except Exception as e:
                 auto_location_reset_failures += 1
                 print(f"[AutoLocationReset] failed for {field['id']}: {e}", flush=True)
@@ -1352,18 +1385,19 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
             write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, result)
             ok += 1
 
-            try:
-                auto_rep = maybe_auto_enqueue_gap_repair(
-                    field=field,
-                    mode=mode,
-                    radius_miles=radius_miles,
-                    latest_hour_utc=meta["fileTimestampUtc"],
-                )
-                if auto_rep.get("queued"):
-                    auto_enqueued_repairs += 1
-            except Exception as e:
-                auto_enqueue_repair_failures += 1
-                print(f"[AutoEnqueueRepair] failed for {field['id']}: {e}", flush=True)
+            if not location_changed_this_run:
+                try:
+                    auto_rep = maybe_auto_enqueue_gap_repair(
+                        field=field,
+                        mode=mode,
+                        radius_miles=radius_miles,
+                        latest_hour_utc=meta["fileTimestampUtc"],
+                    )
+                    if auto_rep.get("queued"):
+                        auto_enqueued_repairs += 1
+                except Exception as e:
+                    auto_enqueue_repair_failures += 1
+                    print(f"[AutoEnqueueRepair] failed for {field['id']}: {e}", flush=True)
 
         except Exception as e:
             fail += 1

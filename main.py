@@ -1,3 +1,24 @@
+# =====================================================================
+# main.py  (FULL FILE)
+# FarmVista NOAA MRMS Pass2->Pass1 fallback rainfall service
+# Rev: 2026-03-23b-auto-reset-on-latlng-change
+#
+# PURPOSE
+# ✅ Pulls MRMS hourly rainfall from NOAA AWS
+# ✅ Writes per-field MRMS parent docs + hourly subcollection
+# ✅ Manages full backfill + gap repair queue
+# ✅ NEW: detects field lat/lng changes automatically inside MRMS
+# ✅ NEW: if lat/lng changed, clears stale MRMS history for that field
+# ✅ NEW: if lat/lng changed, force-resets full backfill queue for that field
+# ✅ NEW: writes the current hour immediately at the new location
+# ✅ NEW: treats moved fields like new fields automatically
+#
+# NOTES
+# - This file handles MRMS automation only.
+# - Weather-cache automation is still handled elsewhere.
+# - Backfill jobs always read the current field lat/lng from Firestore.
+# =====================================================================
+
 import gzip
 import math
 import os
@@ -43,6 +64,8 @@ DEFAULT_REPAIR_LOOKBACK_HOURS = int(os.environ.get("FV_REPAIR_LOOKBACK_HOURS", "
 
 DEFAULT_FULL_BACKFILL_CHUNK_HOURS = int(os.environ.get("FV_FULL_BACKFILL_CHUNK_HOURS", "48"))
 DEFAULT_REPAIR_CHUNK_HOURS = int(os.environ.get("FV_REPAIR_CHUNK_HOURS", "48"))
+
+LOCATION_EPSILON = float(os.environ.get("FV_LOCATION_EPSILON", "0.00001"))
 
 PRODUCT_PRIORITY = [
     "MultiSensor_QPE_01H_Pass2_00.00",
@@ -644,6 +667,24 @@ def build_hour_history_entry(meta, mode, radius_miles, result):
     return entry
 
 
+def locations_match(loc_a, loc_b):
+    if not loc_a or not loc_b:
+        return False
+
+    a_lat = num(loc_a.get("lat"))
+    a_lng = num(loc_a.get("lng"))
+    b_lat = num(loc_b.get("lat"))
+    b_lng = num(loc_b.get("lng"))
+
+    if a_lat is None or a_lng is None or b_lat is None or b_lng is None:
+        return False
+
+    return (
+        abs(a_lat - b_lat) <= LOCATION_EPSILON and
+        abs(a_lng - b_lng) <= LOCATION_EPSILON
+    )
+
+
 def get_field_mrms_state(field_id):
     db = get_db()
     parent_ref = db.collection(MRMS_PARENT_COLLECTION).document(field_id)
@@ -656,6 +697,7 @@ def get_field_mrms_state(field_id):
             "fullBackfillComplete": False,
             "daily30Count": 0,
             "historyMeta": {},
+            "location": None,
         }
 
     data = snap.to_dict() or {}
@@ -679,6 +721,7 @@ def get_field_mrms_state(field_id):
         "fullBackfillComplete": bool(history_meta.get("fullBackfillComplete", False)),
         "daily30Count": len(daily30) if isinstance(daily30, list) else 0,
         "historyMeta": history_meta,
+        "location": data.get("location"),
     }
 
 
@@ -911,6 +954,163 @@ def enqueue_backfill(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RA
     }
 
 
+def force_reset_full_backfill(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES, reason="location_changed"):
+    db = get_db()
+    field = get_field_by_id(field_id)
+    if not field:
+        raise RuntimeError("Field not found")
+
+    days = int(clamp(days, 1, 30))
+    if mode not in {"single", "weighted"}:
+        raise RuntimeError("mode must be 'single' or 'weighted'")
+    if radius_miles <= 0:
+        raise RuntimeError("radiusMiles must be > 0")
+
+    anchor_hour_utc = iso_utc(floor_to_hour_utc(datetime.now(timezone.utc)))
+    doc_id = full_backfill_job_id(field_id)
+    ref = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION).document(doc_id)
+
+    ref.set({
+        "jobType": "full_backfill",
+        "fieldId": field_id,
+        "fieldName": field.get("name"),
+        "status": "queued",
+        "days": days,
+        "mode": mode,
+        "radiusMiles": radius_miles,
+        "anchorHourUtc": anchor_hour_utc,
+        "hoursTotal": days * 24,
+        "hoursDone": 0,
+        "chunkHours": int(clamp(DEFAULT_FULL_BACKFILL_CHUNK_HOURS, 1, 168)),
+        "createdAt": firestore.SERVER_TIMESTAMP,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+        "startedAt": None,
+        "finishedAt": None,
+        "error": None,
+        "resetReason": reason,
+        "attempts": firestore.Increment(1),
+        "lastChunkSummary": None,
+    }, merge=True)
+
+    return {
+        "fieldId": field_id,
+        "fieldName": field.get("name"),
+        "status": "queued",
+        "days": days,
+        "mode": mode,
+        "radiusMiles": radius_miles,
+        "jobType": "full_backfill",
+        "anchorHourUtc": anchor_hour_utc,
+        "hoursTotal": days * 24,
+        "chunkHours": int(clamp(DEFAULT_FULL_BACKFILL_CHUNK_HOURS, 1, 168)),
+        "resetReason": reason,
+    }
+
+
+def delete_subcollection_documents(coll_ref, batch_size=400):
+    deleted = 0
+    while True:
+        docs = list(coll_ref.limit(batch_size).stream())
+        if not docs:
+            break
+        b = get_db().batch()
+        for doc in docs:
+            b.delete(doc.reference)
+            deleted += 1
+        b.commit()
+        if len(docs) < batch_size:
+            break
+    return deleted
+
+
+def reset_field_history_for_location_change(field, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
+    db = get_db()
+    field_id = field["id"]
+    parent_ref = db.collection(MRMS_PARENT_COLLECTION).document(field_id)
+    hourly_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
+
+    deleted_hours = delete_subcollection_documents(hourly_ref)
+
+    parent_ref.set({
+        "fieldId": field_id,
+        "fieldName": field.get("name") or None,
+        "farmId": field.get("farmId"),
+        "farmName": field.get("farmName"),
+        "location": {"lat": field["lat"], "lng": field["lng"]},
+        "mrmsHourlyLatest": {},
+        "mrmsHourlyLast24": [],
+        "mrmsDailySeries30d": [],
+        "mrmsHistoryMeta": {
+            "subcollection": MRMS_HOURLY_SUBCOLLECTION,
+            "keepDays": KEEP_DAYS,
+            "keepHours": KEEP_HOURS,
+            "units": "mm",
+            "latestFileTimestampUtc": None,
+            "latestSelectedProduct": None,
+            "last24Count": 0,
+            "daily30Count": 0,
+            "fullBackfillComplete": False,
+            "backfillCompletedAt": None,
+            "latestRepairEnqueuedAt": None,
+            "locationChangedAt": firestore.SERVER_TIMESTAMP,
+            "locationResetReason": "field_lat_lng_changed",
+        },
+        "mrmsLastUpdatedAt": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+
+    queue_result = force_reset_full_backfill(
+        field_id=field_id,
+        days=KEEP_DAYS,
+        mode=mode,
+        radius_miles=radius_miles,
+        reason="location_changed",
+    )
+
+    return {
+        "fieldId": field_id,
+        "fieldName": field.get("name"),
+        "deletedHourlyDocs": deleted_hours,
+        "queueResult": queue_result,
+    }
+
+
+def maybe_handle_location_change(field, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
+    state = get_field_mrms_state(field["id"])
+    if not state.get("docExists"):
+        return {
+            "locationChanged": False,
+            "action": "no_parent_doc",
+        }
+
+    old_location = state.get("location")
+    new_location = {"lat": field["lat"], "lng": field["lng"]}
+
+    if not old_location:
+        return {
+            "locationChanged": False,
+            "action": "no_saved_location",
+        }
+
+    if locations_match(old_location, new_location):
+        return {
+            "locationChanged": False,
+            "action": "location_unchanged",
+        }
+
+    reset = reset_field_history_for_location_change(
+        field=field,
+        mode=mode,
+        radius_miles=radius_miles,
+    )
+    return {
+        "locationChanged": True,
+        "action": "reset_and_requeued",
+        "oldLocation": old_location,
+        "newLocation": new_location,
+        "reset": reset,
+    }
+
+
 def enqueue_gap_repair(field_id, start_hour_utc, end_hour_utc, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
     db = get_db()
     field = get_field_by_id(field_id)
@@ -1123,9 +1323,19 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
     auto_enqueue_backfill_failures = 0
     auto_enqueued_repairs = 0
     auto_enqueue_repair_failures = 0
+    auto_location_resets = 0
+    auto_location_reset_failures = 0
 
     for field in fields:
         try:
+            try:
+                location_change = maybe_handle_location_change(field, mode, radius_miles)
+                if location_change.get("locationChanged"):
+                    auto_location_resets += 1
+            except Exception as e:
+                auto_location_reset_failures += 1
+                print(f"[AutoLocationReset] failed for {field['id']}: {e}", flush=True)
+
             try:
                 auto = maybe_auto_enqueue_backfill(field, mode, radius_miles)
                 if auto.get("queued"):
@@ -1172,6 +1382,8 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
         "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
         "fileTimestampUtc": meta["fileTimestampUtc"],
         "cacheHit": meta["cacheHit"],
+        "autoLocationResets": auto_location_resets,
+        "autoLocationResetFailures": auto_location_reset_failures,
         "autoEnqueuedBackfills": auto_enqueued_backfills,
         "autoEnqueueBackfillFailures": auto_enqueue_backfill_failures,
         "autoEnqueuedRepairJobs": auto_enqueued_repairs,
@@ -1882,6 +2094,7 @@ def queue_status(limit=50):
             "chunkHours": d.get("chunkHours"),
             "lastChunkSummary": d.get("lastChunkSummary"),
             "error": d.get("error"),
+            "resetReason": d.get("resetReason"),
         })
     return rows
 
@@ -1912,6 +2125,7 @@ def root():
         "repairLookbackHours": DEFAULT_REPAIR_LOOKBACK_HOURS,
         "fullBackfillChunkHours": DEFAULT_FULL_BACKFILL_CHUNK_HOURS,
         "repairChunkHours": DEFAULT_REPAIR_CHUNK_HOURS,
+        "locationEpsilon": LOCATION_EPSILON,
         "rainUnit": "mm",
         "routes": {
             "single": "/api/mrms-1h?lat=39.7898&lon=-91.2059",

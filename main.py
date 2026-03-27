@@ -2564,7 +2564,43 @@ def field_state_route():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
 
+@app.get("/queue-simple")
+def queue_simple():
+    try:
+        db = get_db()
+        docs = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION).stream()
 
+        queued = 0
+        running = 0
+        done = 0
+        failed = 0
+
+        for doc in docs:
+            d = doc.to_dict() or {}
+            status = str(d.get("status") or "").strip().lower()
+
+            if status == "queued":
+                queued += 1
+            elif status == "running":
+                running += 1
+            elif status == "done":
+                done += 1
+            elif status == "failed":
+                failed += 1
+
+        return jsonify({
+            "ok": True,
+            "queued": queued,
+            "running": running,
+            "done": done,
+            "failed": failed
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e)
+        }), 500
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------

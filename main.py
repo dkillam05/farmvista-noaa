@@ -2493,6 +2493,20 @@ def process_next_repair_route():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
 
+@app.get("/process-repair-batch")
+def process_repair_batch_route():
+    try:
+        max_fields = int(request.args.get("maxFields") or 10)
+        max_minutes = float(request.args.get("maxMinutes") or 2)
+
+        out = process_repair_all(
+            max_fields=max_fields,
+            max_minutes=max_minutes,
+        )
+        return jsonify({"ok": True, **out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
+
 
 @app.get("/queue-status")
 def queue_status_route():

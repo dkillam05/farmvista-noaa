@@ -262,13 +262,21 @@ def list_key_for_exact_hour(region, product, target_dt_utc):
     except Exception:
         return None
 
+    matches = []
     for k in keys:
-        if k.endswith(f"_{stamp}.grib2.gz"):
-            return k
-    return None
+        if not k.endswith(".grib2.gz"):
+            continue
+        if stamp in k:
+            matches.append(k)
+
+    if not matches:
+        return None
+    matches.sort()
+    return matches[-1]
 
 
-def pick_best_available_key(now_utc):
+def pick_best_key_for_latest():
+    now_utc = datetime.now(timezone.utc)
     checked = []
 
     for product in PRODUCT_PRIORITY:
@@ -276,12 +284,12 @@ def pick_best_available_key(now_utc):
         checked.append({
             "product": product,
             "found": bool(key),
-            "key": key.replace(f"{AWS_BUCKET}/", "") if key else None,
+            "selectedKey": key.replace(f"{AWS_BUCKET}/", "") if key else None,
         })
         if key:
             return product, key, checked
 
-    raise RuntimeError("No usable MRMS Pass2 or Pass1 hourly QPE file found in NOAA AWS bucket.")
+    return None, None, checked
 
 
 def pick_best_key_for_hour(target_dt_utc):
@@ -292,7 +300,7 @@ def pick_best_key_for_hour(target_dt_utc):
         checked.append({
             "product": product,
             "found": bool(key),
-            "key": key.replace(f"{AWS_BUCKET}/", "") if key else None,
+            "selectedKey": key.replace(f"{AWS_BUCKET}/", "") if key else None,
         })
         if key:
             return product, key, checked
@@ -300,336 +308,281 @@ def pick_best_key_for_hour(target_dt_utc):
     return None, None, checked
 
 
-def open_dataset_from_s3_key(s3_key):
+def gunzip_to_tempfile(fs, key):
+    with fs.open(key, "rb") as f:
+        raw = f.read()
+
+    with gzip.GzipFile(fileobj=tempfile.SpooledTemporaryFile()) as _:
+        pass
+
+    data = gzip.decompress(raw)
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".grib2")
+    tmp.write(data)
+    tmp.flush()
+    tmp.close()
+    return tmp.name
+
+
+def load_dataset_for_key(key):
     ensure_runtime_ready()
     fs = get_fs()
-
-    with fs.open(s3_key, "rb") as f:
-        compressed = f.read()
-
-    raw = gzip.decompress(compressed)
-
-    with tempfile.NamedTemporaryFile(suffix=".grib2", delete=True) as tmp:
-        tmp.write(raw)
-        tmp.flush()
-
-        ds = xr.open_dataset(tmp.name, engine="cfgrib", decode_timedelta=False)
-        ds.load()
-
-        io_info = {
-            "compressedBytes": len(compressed),
-            "decompressedBytes": len(raw),
-            "tempFileSize": os.path.getsize(tmp.name),
-        }
-        return ds, io_info
+    local_path = gunzip_to_tempfile(fs, key)
+    try:
+        ds = xr.open_dataset(local_path, engine="cfgrib")
+        return ds
+    except Exception:
+        try:
+            ds = xr.open_dataset(local_path, engine="pynio")
+            return ds
+        except Exception:
+            raise
+    finally:
+        try:
+            os.remove(local_path)
+        except Exception:
+            pass
 
 
-def get_data_var(ds):
-    preferred = ["unknown", "tp", "precipitation", "precip", "paramId_0"]
+def prepare_cache_for_key(key, product):
+    ts = parse_timestamp_from_key(key)
+    with CACHE_LOCK:
+        if CACHE.get("selectedKey") == key and CACHE.get("dataArray") is not None:
+            CACHE["cacheHit"] = True
+            return
 
-    for name in preferred:
-        if name in ds.data_vars:
-            return ds[name], name
+    ds = load_dataset_for_key(key)
 
-    data_vars = list(ds.data_vars)
-    if not data_vars:
-        raise RuntimeError("Decoded GRIB dataset has no data variables.")
-    return ds[data_vars[0]], data_vars[0]
+    variable_name = None
+    for candidate in ["unknown", "tp", "precip", "precipitation", "param18.0.0"]:
+        if candidate in ds.data_vars:
+            variable_name = candidate
+            break
+    if variable_name is None:
+        data_vars = list(ds.data_vars.keys())
+        if not data_vars:
+            raise RuntimeError("No data variables found in MRMS GRIB.")
+        variable_name = data_vars[0]
 
+    da = ds[variable_name]
 
-def normalize_data_array(da):
-    rename_map = {}
+    with CACHE_LOCK:
+        old_ds = CACHE.get("io")
+        CACHE["selectedKey"] = key
+        CACHE["selectedProduct"] = product
+        CACHE["fileTimestampUtc"] = iso_utc(ts) if ts else None
+        CACHE["variableName"] = variable_name
+        CACHE["dataArray"] = da
+        CACHE["io"] = ds
+        CACHE["cacheHit"] = False
 
-    if "latitude" not in da.coords and "lat" in da.coords:
-        rename_map["lat"] = "latitude"
-    if "longitude" not in da.coords and "lon" in da.coords:
-        rename_map["lon"] = "longitude"
-
-    if rename_map:
-        da = da.rename(rename_map)
-
-    if "latitude" not in da.coords or "longitude" not in da.coords:
-        raise RuntimeError(
-            f"Dataset missing usable latitude/longitude coordinates. Found coords: {list(da.coords)}"
-        )
-
-    for dim in list(da.dims):
-        if dim not in ("latitude", "longitude") and da.sizes.get(dim, 0) == 1:
-            da = da.isel({dim: 0})
-
-    return da
-
-
-def detect_lon_convention(da):
-    lon_vals = da["longitude"].values
-    lon_min = float(np.nanmin(lon_vals))
-    lon_max = float(np.nanmax(lon_vals))
-
-    if lon_min >= 0.0 and lon_max > 180.0:
-        return "0_360"
-
-    return "signed"
-
-
-def to_dataset_lon(lon, lon_mode):
-    if lon_mode == "0_360":
-        return lon if lon >= 0 else lon + 360.0
-    return lon
-
-
-def to_signed_lon(lon):
-    return lon - 360.0 if lon > 180.0 else lon
+    try:
+        if old_ds is not None and old_ds is not ds:
+            old_ds.close()
+    except Exception:
+        pass
 
 
 def get_cached_dataset():
     now_utc = datetime.now(timezone.utc)
-    product, s3_key, checked = pick_best_available_key(now_utc)
-    file_ts = parse_timestamp_from_key(s3_key)
+    product, key, checked = pick_best_key_for_latest()
+    if not product or not key:
+        raise RuntimeError("Could not find recent MRMS data from Pass2 or Pass1.")
 
+    prepare_cache_for_key(key, product)
     with CACHE_LOCK:
-        if CACHE["selectedKey"] == s3_key and CACHE["dataArray"] is not None:
-            return {
-                "selectedProduct": CACHE["selectedProduct"],
-                "selectedKey": CACHE["selectedKey"],
-                "fileTimestampUtc": CACHE["fileTimestampUtc"],
-                "variableName": CACHE["variableName"],
-                "dataArray": CACHE["dataArray"],
-                "io": CACHE["io"],
-                "cacheHit": True,
-                "checkedProducts": checked,
-            }
-
-        ds, io_info = open_dataset_from_s3_key(s3_key)
-        da, variable_name = get_data_var(ds)
-        da = normalize_data_array(da)
-
-        CACHE["selectedKey"] = s3_key
-        CACHE["selectedProduct"] = product
-        CACHE["fileTimestampUtc"] = iso_utc(file_ts) if file_ts else None
-        CACHE["variableName"] = variable_name
-        CACHE["dataArray"] = da
-        CACHE["io"] = io_info
-
         return {
-            "selectedProduct": product,
-            "selectedKey": s3_key,
-            "fileTimestampUtc": iso_utc(file_ts) if file_ts else None,
-            "variableName": variable_name,
-            "dataArray": da,
-            "io": io_info,
-            "cacheHit": False,
+            "selectedProduct": CACHE.get("selectedProduct"),
+            "selectedKey": CACHE.get("selectedKey"),
+            "fileTimestampUtc": CACHE.get("fileTimestampUtc"),
+            "variableName": CACHE.get("variableName"),
+            "dataArray": CACHE.get("dataArray"),
+            "cacheHit": bool(CACHE.get("cacheHit")),
+            "io": None,
             "checkedProducts": checked,
         }
 
 
-def get_dataset_for_key_uncached(product, s3_key):
-    file_ts = parse_timestamp_from_key(s3_key)
-    ds, io_info = open_dataset_from_s3_key(s3_key)
-    da, variable_name = get_data_var(ds)
-    da = normalize_data_array(da)
+def get_dataset_for_key_uncached(product, key):
+    ds = load_dataset_for_key(key)
+
+    variable_name = None
+    for candidate in ["unknown", "tp", "precip", "precipitation", "param18.0.0"]:
+        if candidate in ds.data_vars:
+            variable_name = candidate
+            break
+    if variable_name is None:
+        data_vars = list(ds.data_vars.keys())
+        if not data_vars:
+            raise RuntimeError("No data variables found in MRMS GRIB.")
+        variable_name = data_vars[0]
+
+    da = ds[variable_name]
+    ts = parse_timestamp_from_key(key)
+
     return {
         "selectedProduct": product,
-        "selectedKey": s3_key,
-        "fileTimestampUtc": iso_utc(file_ts) if file_ts else None,
+        "selectedKey": key,
+        "fileTimestampUtc": iso_utc(ts) if ts else None,
         "variableName": variable_name,
         "dataArray": da,
-        "io": io_info,
         "cacheHit": False,
+        "io": ds,
     }
 
 
-def sample_nearest_with_grid(da, lat, lon):
-    lon_mode = detect_lon_convention(da)
-    query_lon = to_dataset_lon(lon, lon_mode)
+def get_cache_da():
+    with CACHE_LOCK:
+        da = CACHE.get("dataArray")
+        if da is None:
+            raise RuntimeError("MRMS cache is empty.")
+        return da
 
-    sampled = da.sel(latitude=lat, longitude=query_lon, method="nearest")
 
-    value = sampled.values
-    if isinstance(value, np.ndarray):
-        value = np.asarray(value).squeeze()
-        if np.size(value) != 1:
-            raise RuntimeError("Unexpected non-scalar sampled value from MRMS dataset.")
-        value = float(value)
-    else:
-        value = float(value)
+def latlon_name_candidates(da):
+    dims = list(da.dims)
+    coords = list(da.coords)
+    lat_names = [n for n in ["latitude", "lat", "y"] if n in dims or n in coords]
+    lon_names = [n for n in ["longitude", "lon", "x"] if n in dims or n in coords]
+    if not lat_names or not lon_names:
+        raise RuntimeError(f"Could not identify lat/lon axes. dims={dims}, coords={coords}")
+    return lat_names[0], lon_names[0]
 
-    grid_lat = float(sampled["latitude"].values)
-    raw_grid_lon = float(sampled["longitude"].values)
-    signed_grid_lon = to_signed_lon(raw_grid_lon)
 
-    if not math.isfinite(value) or value < 0:
+def sample_one_point(da, lat, lon):
+    lat_name, lon_name = latlon_name_candidates(da)
+    selected = da.sel({lat_name: lat, lon_name: lon}, method="nearest")
+    value = float(selected.values)
+    return value
+
+
+def mm_from_dataset_value(value):
+    if value is None or not math.isfinite(value):
+        return None
+    if value < 0:
         value = 0.0
-
-    return {
-        "mm": value,
-        "nearestGridLatitude": grid_lat,
-        "nearestGridLongitude": signed_grid_lon,
-        "nearestGridLongitudeRaw": raw_grid_lon,
-        "queryLongitudeUsed": query_lon,
-        "longitudeMode": lon_mode,
-    }
+    return value
 
 
-def build_weighted_points(lat, lon, radius_miles):
-    pts = []
-    for p in SAMPLE_POINTS:
-        plat, plon = offset_point(
-            lat,
-            lon,
-            p["dxMiles"] * radius_miles,
-            p["dyMiles"] * radius_miles,
+def compute_weighted_mm(da, lat, lon, radius_miles):
+    total_weight = 0.0
+    weighted_sum = 0.0
+    samples_out = []
+
+    for sp in SAMPLE_POINTS:
+        p_lat, p_lon = offset_point(
+            lat, lon,
+            east_miles=sp["dxMiles"] * radius_miles,
+            north_miles=sp["dyMiles"] * radius_miles,
         )
-        pts.append({
-            "key": p["key"],
-            "weight": p["weight"],
-            "lat": plat,
-            "lon": plon,
+        raw_mm = sample_one_point(da, p_lat, p_lon)
+        rain_mm = mm_from_dataset_value(raw_mm)
+        if rain_mm is None:
+            rain_mm = 0.0
+        weighted_sum += rain_mm * sp["weight"]
+        total_weight += sp["weight"]
+        samples_out.append({
+            "key": sp["key"],
+            "lat": round_num(p_lat, 6),
+            "lon": round_num(p_lon, 6),
+            "weight": sp["weight"],
+            "rainMm": round_num(rain_mm, 4),
         })
-    return pts
+
+    final_mm = weighted_sum / total_weight if total_weight > 0 else 0.0
+    if final_mm < 0:
+        final_mm = 0.0
+
+    return round_num(final_mm, 4), samples_out
 
 
-def parse_bulk_points_from_query(points_str):
-    points = []
-    if not points_str:
-        return points
+def build_single_result(da, lat, lng):
+    hourly_rain_mm = mm_from_dataset_value(sample_one_point(da, lat, lng))
+    if hourly_rain_mm is None:
+        hourly_rain_mm = 0.0
 
-    chunks = [x.strip() for x in points_str.split(";") if x.strip()]
-    for idx, chunk in enumerate(chunks):
-        parts = [p.strip() for p in chunk.split(",")]
-        if len(parts) != 2:
-            raise RuntimeError(f"Invalid points format at item {idx + 1}. Use lat,lon;lat,lon")
-        lat = num(parts[0])
-        lon = num(parts[1])
-        if lat is None or lon is None:
-            raise RuntimeError(f"Invalid numeric lat/lon at item {idx + 1}")
-        points.append({"lat": lat, "lon": lon})
-    return points
-
-
-def validate_point(lat, lon):
-    if lat is None or lon is None:
-        raise RuntimeError("Missing or invalid lat/lon")
-    if lat < -90 or lat > 90 or lon < -180 or lon > 180:
-        raise RuntimeError("lat/lon out of range")
-
-
-def build_single_result(da, lat, lon):
-    sampled = sample_nearest_with_grid(da, lat, lon)
     return {
-        "lat": round_num(lat, 6),
-        "lon": round_num(lon, 6),
-        "hourlyRainMm": round_num(sampled["mm"], 4),
-        "nearestGridLatitude": round_num(sampled["nearestGridLatitude"], 6),
-        "nearestGridLongitude": round_num(sampled["nearestGridLongitude"], 6),
-        "nearestGridLongitudeRaw": round_num(sampled["nearestGridLongitudeRaw"], 6),
-        "queryLongitudeUsed": round_num(sampled["queryLongitudeUsed"], 6),
-        "longitudeMode": sampled["longitudeMode"],
+        "hourlyRainMm": round_num(hourly_rain_mm, 4),
+        "nearestGridLatitude": round_num(lat, 6),
+        "nearestGridLongitude": round_num(lng, 6),
+        "nearestGridLongitudeRaw": round_num(lng, 6),
+        "queryLongitudeUsed": round_num(lng, 6),
+        "longitudeMode": "native",
     }
 
 
-def build_weighted_result(da, lat, lon, radius_miles):
-    pts = build_weighted_points(lat, lon, radius_miles)
-    samples = []
-    good = []
-
-    for p in pts:
-        sampled = sample_nearest_with_grid(da, p["lat"], p["lon"])
-        rec = {
-            "key": p["key"],
-            "weight": p["weight"],
-            "lat": round_num(p["lat"], 6),
-            "lon": round_num(p["lon"], 6),
-            "mm": round_num(sampled["mm"], 4),
-            "nearestGridLatitude": round_num(sampled["nearestGridLatitude"], 6),
-            "nearestGridLongitude": round_num(sampled["nearestGridLongitude"], 6),
-            "nearestGridLongitudeRaw": round_num(sampled["nearestGridLongitudeRaw"], 6),
-            "queryLongitudeUsed": round_num(sampled["queryLongitudeUsed"], 6),
-            "longitudeMode": sampled["longitudeMode"],
-            "ok": True,
-        }
-        samples.append(rec)
-        good.append(rec)
-
-    used_weight = sum(s["weight"] for s in good)
-    weighted_mm = sum((s["mm"] or 0.0) * s["weight"] for s in good) / used_weight
+def build_weighted_result(da, lat, lng, radius_miles):
+    weighted_mm, samples = compute_weighted_mm(da, lat, lng, radius_miles)
 
     return {
-        "lat": round_num(lat, 6),
-        "lon": round_num(lon, 6),
-        "radiusMiles": radius_miles,
         "weightedHourlyRainMm": round_num(weighted_mm, 4),
-        "attemptedPointCount": len(samples),
-        "successfulPointCount": len(good),
+        "attemptedPointCount": len(SAMPLE_POINTS),
+        "successfulPointCount": len(samples),
         "samples": samples,
+        "hourlyRainMm": round_num(weighted_mm, 4),
+        "nearestGridLatitude": round_num(lat, 6),
+        "nearestGridLongitude": round_num(lng, 6),
+        "nearestGridLongitudeRaw": round_num(lng, 6),
+        "queryLongitudeUsed": round_num(lng, 6),
+        "longitudeMode": "weighted",
+    }
+
+
+def get_field_by_id(field_id):
+    snap = get_db().collection(FIELDS_COLLECTION).document(field_id).get()
+    if not snap.exists:
+        return None
+
+    data = snap.to_dict() or {}
+    loc = data.get("location") or {}
+
+    lat = num(loc.get("lat"))
+    lng = num(loc.get("lng"))
+    if lat is None or lng is None:
+        lat = num(data.get("lat"))
+        lng = num(data.get("lng"))
+
+    return {
+        "id": snap.id,
+        "name": data.get("name"),
+        "farmId": data.get("farmId"),
+        "farmName": data.get("farmName"),
+        "lat": lat,
+        "lng": lng,
     }
 
 
 def load_active_fields_for_batch():
-    db = get_db()
-    raw = []
+    docs = (
+        get_db()
+        .collection(FIELDS_COLLECTION)
+        .where("archived", "==", False)
+        .stream()
+    )
 
-    try:
-        snap = db.collection(FIELDS_COLLECTION).where("status", "==", "active").stream()
-        for doc in snap:
-            raw.append({"id": doc.id, "data": doc.to_dict() or {}})
-    except Exception as e:
-        print(f"[Batch] fields query(status==active) failed: {e}", flush=True)
+    rows = []
+    for doc in docs:
+        data = doc.to_dict() or {}
+        loc = data.get("location") or {}
 
-    if not raw:
-        try:
-            snap2 = db.collection(FIELDS_COLLECTION).stream()
-            for doc in snap2:
-                raw.append({"id": doc.id, "data": doc.to_dict() or {}})
-        except Exception as e:
-            print(f"[Batch] fields query(all) failed: {e}", flush=True)
-            raw = []
-
-    out = []
-    for r in raw:
-        d = r["data"] or {}
-        status = str(d.get("status", "")).strip().lower()
-        if status != "active":
-            continue
-
-        loc = d.get("location") or {}
         lat = num(loc.get("lat"))
         lng = num(loc.get("lng"))
         if lat is None or lng is None:
+            lat = num(data.get("lat"))
+            lng = num(data.get("lng"))
+
+        if lat is None or lng is None:
             continue
 
-        out.append({
-            "id": r["id"],
-            "name": str(d.get("name") or ""),
-            "farmId": d.get("farmId"),
-            "farmName": d.get("farmName"),
+        rows.append({
+            "id": doc.id,
+            "name": data.get("name"),
+            "farmId": data.get("farmId"),
+            "farmName": data.get("farmName"),
             "lat": lat,
             "lng": lng,
         })
 
-    return out
-
-
-def get_field_by_id(field_id):
-    db = get_db()
-    doc = db.collection(FIELDS_COLLECTION).document(field_id).get()
-    if not doc.exists:
-        return None
-
-    d = doc.to_dict() or {}
-    loc = d.get("location") or {}
-    lat = num(loc.get("lat"))
-    lng = num(loc.get("lng"))
-    if lat is None or lng is None:
-        raise RuntimeError("Field exists but location.lat/lng is missing or invalid")
-
-    return {
-        "id": doc.id,
-        "name": str(d.get("name") or ""),
-        "farmId": d.get("farmId"),
-        "farmName": d.get("farmName"),
-        "lat": lat,
-        "lng": lng,
-    }
+    return rows
 
 
 def extract_rain_value(mode, result):
@@ -788,6 +741,165 @@ def build_latest_payload(field, meta, mode, radius_miles, result, last24, daily3
     }
 
 
+def normalize_hour_history_row(row, fallback_hour_key=None):
+    if not isinstance(row, dict):
+        return None
+
+    ts = str(row.get("fileTimestampUtc") or "").strip()
+    if not ts:
+        return None
+
+    rain_mm = get_doc_rain_mm(row)
+    if rain_mm is None:
+        return None
+
+    return {
+        "hourKey": row.get("hourKey") or fallback_hour_key or hour_doc_id_from_iso(ts),
+        "fileTimestampUtc": ts,
+        "rainMm": round_num(rain_mm, 4),
+        "selectedProduct": row.get("selectedProduct"),
+        "mode": row.get("mode"),
+        "source": row.get("source"),
+    }
+
+
+def trim_daily30_map(daily_map, anchor_dt_utc):
+    tz = get_app_tz()
+    anchor_local_date = anchor_dt_utc.astimezone(tz).date()
+    keep_dates = set()
+    for i in range(KEEP_DAYS):
+        keep_dates.add((anchor_local_date - timedelta(days=i)).isoformat())
+
+    daily30 = []
+    for date_iso, row in daily_map.items():
+        if date_iso not in keep_dates:
+            continue
+        daily30.append({
+            "dateISO": date_iso,
+            "rainMm": round_num(num(row.get("rainMm")) or 0.0, 4),
+            "hoursCount": int(num(row.get("hoursCount")) or 0),
+        })
+
+    daily30.sort(key=lambda x: x["dateISO"])
+    return daily30[-KEEP_DAYS:]
+
+
+def build_incremental_rollups(existing_parent, new_history_entry, previous_hour_entry=None):
+    tz = get_app_tz()
+    new_row = normalize_hour_history_row(new_history_entry)
+    if not new_row:
+        raise RuntimeError("Unable to build incremental MRMS rollups; invalid hour entry.")
+
+    new_dt = parse_iso_utc(new_row["fileTimestampUtc"])
+    new_local_date = new_dt.astimezone(tz).date().isoformat()
+
+    cutoff_dt = new_dt - timedelta(days=KEEP_DAYS)
+    cutoff_iso = iso_utc(cutoff_dt)
+
+    existing_last24 = []
+    for row in (existing_parent.get("mrmsHourlyLast24") or []):
+        norm = normalize_hour_history_row(row)
+        if not norm:
+            continue
+        if norm["fileTimestampUtc"] < cutoff_iso:
+            continue
+        existing_last24.append(norm)
+
+    row_map = {row["fileTimestampUtc"]: row for row in existing_last24}
+    row_map[new_row["fileTimestampUtc"]] = new_row
+    last24 = list(row_map.values())
+    last24.sort(key=lambda x: x["fileTimestampUtc"], reverse=True)
+    last24 = last24[:LAST24_COUNT]
+
+    daily_map = {}
+    for row in (existing_parent.get("mrmsDailySeries30d") or []):
+        if not isinstance(row, dict):
+            continue
+        date_iso = str(row.get("dateISO") or "").strip()
+        if not date_iso:
+            continue
+        daily_map[date_iso] = {
+            "dateISO": date_iso,
+            "rainMm": round_num(num(row.get("rainMm")) or 0.0, 4),
+            "hoursCount": int(num(row.get("hoursCount")) or 0),
+        }
+
+    bucket = daily_map.get(new_local_date)
+    if bucket is None:
+        bucket = {"dateISO": new_local_date, "rainMm": 0.0, "hoursCount": 0}
+        daily_map[new_local_date] = bucket
+
+    prev_row = normalize_hour_history_row(previous_hour_entry) if previous_hour_entry else None
+    prev_dt = None
+    prev_local_date = None
+    if prev_row:
+        try:
+            prev_dt = parse_iso_utc(prev_row["fileTimestampUtc"])
+            prev_local_date = prev_dt.astimezone(tz).date().isoformat()
+        except Exception:
+            prev_row = None
+            prev_dt = None
+            prev_local_date = None
+
+    if prev_row and prev_local_date:
+        prev_bucket = daily_map.get(prev_local_date)
+        if prev_bucket is None:
+            prev_bucket = {"dateISO": prev_local_date, "rainMm": 0.0, "hoursCount": 0}
+            daily_map[prev_local_date] = prev_bucket
+
+        prev_bucket["rainMm"] = round_num((num(prev_bucket.get("rainMm")) or 0.0) - (num(prev_row.get("rainMm")) or 0.0), 4)
+        if prev_bucket["rainMm"] < 0:
+            prev_bucket["rainMm"] = 0.0
+
+        if prev_local_date != new_local_date:
+            prev_bucket["hoursCount"] = max(0, int(num(prev_bucket.get("hoursCount")) or 0) - 1)
+
+    bucket["rainMm"] = round_num((num(bucket.get("rainMm")) or 0.0) + (num(new_row.get("rainMm")) or 0.0), 4)
+    if bucket["rainMm"] < 0:
+        bucket["rainMm"] = 0.0
+
+    if not prev_row or prev_row["fileTimestampUtc"] != new_row["fileTimestampUtc"]:
+        bucket["hoursCount"] = int(num(bucket.get("hoursCount")) or 0) + 1
+
+    last24.sort(key=lambda x: x["fileTimestampUtc"], reverse=True)
+    daily30 = trim_daily30_map(daily_map, new_dt)
+    return last24, daily30
+
+
+def maybe_prune_old_hourly_docs(field_id, anchor_hour_utc):
+    db = get_db()
+    parent_ref = db.collection(MRMS_PARENT_COLLECTION).document(field_id)
+    hourly_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
+    anchor_dt = floor_to_hour_utc(parse_iso_utc(anchor_hour_utc))
+    tz = get_app_tz()
+
+    if anchor_dt.astimezone(tz).hour != 0:
+        return {"deleted": 0, "skipped": True}
+
+    cutoff_dt = anchor_dt - timedelta(days=KEEP_DAYS)
+    cutoff_iso = iso_utc(cutoff_dt)
+
+    old_docs = list(hourly_ref.where("fileTimestampUtc", "<", cutoff_iso).stream())
+    if not old_docs:
+        return {"deleted": 0, "skipped": False}
+
+    deleted = 0
+    b = db.batch()
+    count = 0
+    for doc in old_docs:
+        b.delete(doc.reference)
+        deleted += 1
+        count += 1
+        if count >= 400:
+            b.commit()
+            b = db.batch()
+            count = 0
+    if count > 0:
+        b.commit()
+
+    return {"deleted": deleted, "skipped": False}
+
+
 def rebuild_last24_and_daily30(field_id):
     db = get_db()
     tz = get_app_tz()
@@ -816,18 +928,10 @@ def rebuild_last24_and_daily30(field_id):
     rows = []
     for doc in docs:
         d = doc.to_dict() or {}
-        ts = str(d.get("fileTimestampUtc") or "")
-        rain_mm = get_doc_rain_mm(d)
-        if not ts or rain_mm is None:
+        norm = normalize_hour_history_row(d, fallback_hour_key=doc.id)
+        if not norm:
             continue
-        rows.append({
-            "hourKey": doc.id,
-            "fileTimestampUtc": ts,
-            "rainMm": round_num(rain_mm, 4),
-            "selectedProduct": d.get("selectedProduct"),
-            "mode": d.get("mode"),
-            "source": d.get("source"),
-        })
+        rows.append(norm)
 
     rows.sort(key=lambda x: x["fileTimestampUtc"], reverse=True)
     last24 = rows[:LAST24_COUNT]
@@ -845,8 +949,8 @@ def rebuild_last24_and_daily30(field_id):
             bucket = {"dateISO": local_date, "rainMm": 0.0, "hoursCount": 0}
             daily_map[local_date] = bucket
 
-        bucket["rainMm"] += float(row["rainMm"] or 0.0)
-        bucket["hoursCount"] += 1
+        bucket["rainMm"] = round_num((num(bucket.get("rainMm")) or 0.0) + (num(row.get("rainMm")) or 0.0), 4)
+        bucket["hoursCount"] = int(num(bucket.get("hoursCount")) or 0) + 1
 
     daily30 = [
         {
@@ -862,10 +966,26 @@ def rebuild_last24_and_daily30(field_id):
 
 def write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, result):
     history_entry = build_hour_history_entry(meta, mode, radius_miles, result)
+
+    parent_snap = parent_ref.get()
+    existing_parent = parent_snap.to_dict() or {}
+
+    previous_hour_entry = None
+    previous_hour_snap = hour_ref.get()
+    if previous_hour_snap.exists:
+        previous_hour_entry = previous_hour_snap.to_dict() or {}
+
     hour_ref.set(history_entry, merge=True)
 
-    last24, daily30 = rebuild_last24_and_daily30(field["id"])
-    existing_state = get_field_mrms_state(field["id"])
+    last24, daily30 = build_incremental_rollups(
+        existing_parent=existing_parent,
+        new_history_entry=history_entry,
+        previous_hour_entry=previous_hour_entry,
+    )
+
+    existing_state = {
+        "historyMeta": existing_parent.get("mrmsHistoryMeta") or {},
+    }
 
     parent_payload = build_latest_payload(
         field=field,
@@ -878,6 +998,11 @@ def write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, resu
         existing_state=existing_state,
     )
     parent_ref.set(parent_payload, merge=True)
+
+    try:
+        maybe_prune_old_hourly_docs(field["id"], meta["fileTimestampUtc"])
+    except Exception as e:
+        print(f"[MRMS Prune] failed for {field['id']}: {e}", flush=True)
 
 
 def queue_job_exists_active(doc_id):
@@ -931,6 +1056,8 @@ def enqueue_backfill(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RA
     if radius_miles <= 0:
         raise RuntimeError("radiusMiles must be > 0")
 
+    total_hours = days * 24
+    chunk_hours = int(clamp(DEFAULT_FULL_BACKFILL_CHUNK_HOURS, 1, 168))
     doc_id = full_backfill_job_id(field_id)
     ref = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION).document(doc_id)
 
@@ -939,14 +1066,12 @@ def enqueue_backfill(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RA
             "fieldId": field_id,
             "fieldName": field.get("name"),
             "status": "already_active",
+            "jobType": "full_backfill",
             "days": days,
             "mode": mode,
             "radiusMiles": radius_miles,
-            "jobType": "full_backfill",
         }
 
-    anchor_hour_utc = iso_utc(floor_to_hour_utc(datetime.now(timezone.utc)))
-
     ref.set({
         "jobType": "full_backfill",
         "fieldId": field_id,
@@ -955,10 +1080,9 @@ def enqueue_backfill(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RA
         "days": days,
         "mode": mode,
         "radiusMiles": radius_miles,
-        "anchorHourUtc": anchor_hour_utc,
-        "hoursTotal": days * 24,
+        "hoursTotal": total_hours,
         "hoursDone": 0,
-        "chunkHours": int(clamp(DEFAULT_FULL_BACKFILL_CHUNK_HOURS, 1, 168)),
+        "chunkHours": chunk_hours,
         "createdAt": firestore.SERVER_TIMESTAMP,
         "updatedAt": firestore.SERVER_TIMESTAMP,
         "startedAt": None,
@@ -972,101 +1096,52 @@ def enqueue_backfill(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RA
         "fieldId": field_id,
         "fieldName": field.get("name"),
         "status": "queued",
+        "jobType": "full_backfill",
         "days": days,
         "mode": mode,
         "radiusMiles": radius_miles,
-        "jobType": "full_backfill",
-        "anchorHourUtc": anchor_hour_utc,
-        "hoursTotal": days * 24,
-        "chunkHours": int(clamp(DEFAULT_FULL_BACKFILL_CHUNK_HOURS, 1, 168)),
+        "hoursTotal": total_hours,
+        "chunkHours": chunk_hours,
     }
 
 
-def force_reset_full_backfill(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES, reason="location_changed"):
+def delete_hourly_history_for_field(field_id):
     db = get_db()
-    field = get_field_by_id(field_id)
-    if not field:
-        raise RuntimeError("Field not found")
+    parent_ref = db.collection(MRMS_PARENT_COLLECTION).document(field_id)
+    hourly_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
 
-    days = int(clamp(days, 1, 30))
-    if mode not in {"single", "weighted"}:
-        raise RuntimeError("mode must be 'single' or 'weighted'")
-    if radius_miles <= 0:
-        raise RuntimeError("radiusMiles must be > 0")
-
-    anchor_hour_utc = iso_utc(floor_to_hour_utc(datetime.now(timezone.utc)))
-    doc_id = full_backfill_job_id(field_id)
-    ref = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION).document(doc_id)
-
-    ref.set({
-        "jobType": "full_backfill",
-        "fieldId": field_id,
-        "fieldName": field.get("name"),
-        "status": "queued",
-        "days": days,
-        "mode": mode,
-        "radiusMiles": radius_miles,
-        "anchorHourUtc": anchor_hour_utc,
-        "hoursTotal": days * 24,
-        "hoursDone": 0,
-        "chunkHours": int(clamp(DEFAULT_FULL_BACKFILL_CHUNK_HOURS, 1, 168)),
-        "createdAt": firestore.SERVER_TIMESTAMP,
-        "updatedAt": firestore.SERVER_TIMESTAMP,
-        "startedAt": None,
-        "finishedAt": None,
-        "error": None,
-        "resetReason": reason,
-        "attempts": firestore.Increment(1),
-        "lastChunkSummary": None,
-    }, merge=True)
-
-    return {
-        "fieldId": field_id,
-        "fieldName": field.get("name"),
-        "status": "queued",
-        "days": days,
-        "mode": mode,
-        "radiusMiles": radius_miles,
-        "jobType": "full_backfill",
-        "anchorHourUtc": anchor_hour_utc,
-        "hoursTotal": days * 24,
-        "chunkHours": int(clamp(DEFAULT_FULL_BACKFILL_CHUNK_HOURS, 1, 168)),
-        "resetReason": reason,
-    }
-
-
-def delete_subcollection_documents(coll_ref, batch_size=400):
     deleted = 0
     while True:
-        docs = list(coll_ref.limit(batch_size).stream())
+        docs = list(hourly_ref.limit(400).stream())
         if not docs:
             break
-        b = get_db().batch()
+
+        b = db.batch()
         for doc in docs:
             b.delete(doc.reference)
             deleted += 1
         b.commit()
-        if len(docs) < batch_size:
+
+        if len(docs) < 400:
             break
+
     return deleted
 
 
 def reset_field_history_for_location_change(field, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
     db = get_db()
-    field_id = field["id"]
-    parent_ref = db.collection(MRMS_PARENT_COLLECTION).document(field_id)
-    hourly_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
+    parent_ref = db.collection(MRMS_PARENT_COLLECTION).document(field["id"])
 
-    deleted_hours = delete_subcollection_documents(hourly_ref)
-    deleted_queue_jobs = delete_queue_jobs_for_field(field_id)
+    deleted_hourly_docs = delete_hourly_history_for_field(field["id"])
+    deleted_queue_jobs = delete_queue_jobs_for_field(field["id"])
 
     parent_ref.set({
-        "fieldId": field_id,
-        "fieldName": field.get("name") or None,
+        "fieldId": field["id"],
+        "fieldName": field.get("name"),
         "farmId": field.get("farmId"),
         "farmName": field.get("farmName"),
         "location": {"lat": field["lat"], "lng": field["lng"]},
-        "mrmsHourlyLatest": {},
+        "mrmsHourlyLatest": firestore.DELETE_FIELD,
         "mrmsHourlyLast24": [],
         "mrmsDailySeries30d": [],
         "mrmsHistoryMeta": {
@@ -1081,26 +1156,24 @@ def reset_field_history_for_location_change(field, mode="weighted", radius_miles
             "fullBackfillComplete": False,
             "backfillCompletedAt": None,
             "latestRepairEnqueuedAt": None,
-            "locationChangedAt": firestore.SERVER_TIMESTAMP,
-            "locationResetReason": "field_lat_lng_changed",
+            "locationResetAt": firestore.SERVER_TIMESTAMP,
         },
         "mrmsLastUpdatedAt": firestore.SERVER_TIMESTAMP,
     }, merge=True)
 
-    queue_result = force_reset_full_backfill(
-        field_id=field_id,
+    queued = enqueue_backfill(
+        field_id=field["id"],
         days=KEEP_DAYS,
         mode=mode,
         radius_miles=radius_miles,
-        reason="location_changed",
     )
 
     return {
-        "fieldId": field_id,
+        "fieldId": field["id"],
         "fieldName": field.get("name"),
-        "deletedHourlyDocs": deleted_hours,
+        "deletedHourlyDocs": deleted_hourly_docs,
         "deletedQueueJobs": deleted_queue_jobs,
-        "queueResult": queue_result,
+        "queuedBackfill": queued,
     }
 
 
@@ -1542,9 +1615,15 @@ def backfill_field(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADI
 
             hour_id = hour_doc_id_from_iso(meta["fileTimestampUtc"])
             hour_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION).document(hour_id)
-            history_entry = build_hour_history_entry(meta, mode, radius_miles, result)
-            hour_ref.set(history_entry, merge=True)
+            write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, result)
             ok += 1
+
+            try:
+                if meta.get("io") is not None:
+                    meta["io"].close()
+            except Exception:
+                pass
+
         except Exception as e:
             fail += 1
             failures.append({
@@ -1552,57 +1631,112 @@ def backfill_field(field_id, days=30, mode="weighted", radius_miles=DEFAULT_RADI
                 "error": str(e),
             })
 
-    finalize_field_parent_from_hourly(field["id"], mark_full_backfill_complete=True)
+    finalized = finalize_field_parent_from_hourly(field["id"], mark_full_backfill_complete=True)
 
     return {
         "fieldId": field["id"],
         "fieldName": field.get("name"),
-        "daysRequested": days,
-        "hoursRequested": total_hours,
+        "days": days,
+        "mode": mode,
+        "radiusMiles": radius_miles,
+        "totalHours": total_hours,
         "ok": ok,
-        "skippedNoFile": skipped,
+        "skipped": skipped,
         "fail": fail,
-        "historySubcollection": MRMS_HOURLY_SUBCOLLECTION,
-        "failures": failures[:50],
+        "finalized": finalized,
+        "failures": failures[:25],
     }
 
 
-def backfill_field_chunk(field_id, anchor_hour_utc, hours_total, hours_done, chunk_hours, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES, deadline_ts=None):
+def process_next_backfill():
+    db = get_db()
+    queued = list(
+        db.collection(MRMS_BACKFILL_QUEUE_COLLECTION)
+        .where("status", "==", "queued")
+        .limit(1)
+        .stream()
+    )
+
+    if not queued:
+        return {
+            "processed": False,
+            "reason": "no_queued_jobs",
+        }
+
+    job_doc = queued[0]
+    job = job_doc.to_dict() or {}
+    job_type = str(job.get("jobType") or "").strip().lower()
+
+    if job_type == "repair_gap":
+        return process_next_repair_gap()
+
+    field_id = job.get("fieldId")
+    mode = job.get("mode") or "weighted"
+    radius_miles = num(job.get("radiusMiles")) or DEFAULT_RADIUS_MILES
+    days = int(clamp(job.get("days"), 1, 30))
+    chunk_hours = int(clamp(job.get("chunkHours") or DEFAULT_FULL_BACKFILL_CHUNK_HOURS, 1, 168))
+
     field = get_field_by_id(field_id)
     if not field:
-        raise RuntimeError("Field not found")
+        job_doc.reference.set({
+            "status": "failed",
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "finishedAt": firestore.SERVER_TIMESTAMP,
+            "error": "Field not found",
+        }, merge=True)
+        return {
+            "processed": False,
+            "jobId": job_doc.id,
+            "status": "failed",
+            "reason": "field_not_found",
+        }
 
-    if mode not in {"single", "weighted"}:
-        raise RuntimeError("mode must be 'single' or 'weighted'")
-    if radius_miles <= 0:
-        raise RuntimeError("radiusMiles must be > 0")
+    now_utc = datetime.now(timezone.utc)
+    this_hour = floor_to_hour_utc(now_utc)
+    total_hours = days * 24
 
-    anchor_dt = floor_to_hour_utc(parse_iso_utc(anchor_hour_utc))
-    hours_total = int(clamp(hours_total, 1, KEEP_HOURS))
-    hours_done = int(clamp(hours_done, 0, hours_total))
-    chunk_hours = int(clamp(chunk_hours, 1, 168))
+    hours_done = int(num(job.get("hoursDone")) or 0)
+    if hours_done < 0:
+        hours_done = 0
+    if hours_done >= total_hours:
+        job_doc.reference.set({
+            "status": "done",
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "finishedAt": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+        finalized = finalize_field_parent_from_hourly(field_id, mark_full_backfill_complete=True)
+        return {
+            "processed": True,
+            "jobId": job_doc.id,
+            "status": "done",
+            "fieldId": field_id,
+            "fieldName": field.get("name"),
+            "hoursDone": hours_done,
+            "hoursTotal": total_hours,
+            "finalized": finalized,
+        }
 
-    start_index = hours_done
-    end_index = min(hours_total, start_index + chunk_hours)
+    job_doc.reference.set({
+        "status": "running",
+        "startedAt": firestore.SERVER_TIMESTAMP if not job.get("startedAt") else job.get("startedAt"),
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
 
-    parent_ref = get_db().collection(MRMS_PARENT_COLLECTION).document(field["id"])
+    parent_ref = db.collection(MRMS_PARENT_COLLECTION).document(field["id"])
 
     ok = 0
     skipped = 0
     fail = 0
     failures = []
-    processed_slots = 0
+    processed_hours = 0
 
-    for i in range(start_index, end_index):
-        if deadline_ts is not None and time.time() >= deadline_ts:
-            break
-
-        target_dt = anchor_dt - timedelta(hours=i)
+    for offset in range(hours_done, min(hours_done + chunk_hours, total_hours)):
+        target_dt = this_hour - timedelta(hours=offset)
         product, s3_key, checked = pick_best_key_for_hour(target_dt)
 
         if not s3_key:
             skipped += 1
-            processed_slots += 1
+            processed_hours += 1
             continue
 
         try:
@@ -1614,537 +1748,244 @@ def backfill_field_chunk(field_id, anchor_hour_utc, hours_total, hours_done, chu
 
             hour_id = hour_doc_id_from_iso(meta["fileTimestampUtc"])
             hour_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION).document(hour_id)
-            history_entry = build_hour_history_entry(meta, mode, radius_miles, result)
-            hour_ref.set(history_entry, merge=True)
+            write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, result)
             ok += 1
+            processed_hours += 1
+
+            try:
+                if meta.get("io") is not None:
+                    meta["io"].close()
+            except Exception:
+                pass
+
         except Exception as e:
             fail += 1
+            processed_hours += 1
             failures.append({
                 "targetHourUtc": iso_utc(target_dt),
                 "error": str(e),
             })
 
-        processed_slots += 1
+    new_hours_done = hours_done + processed_hours
+    finished = new_hours_done >= total_hours
 
-    new_hours_done = hours_done + processed_slots
-    is_complete = new_hours_done >= hours_total
+    last_chunk_summary = {
+        "processedHours": processed_hours,
+        "ok": ok,
+        "skipped": skipped,
+        "fail": fail,
+        "finished": finished,
+        "updatedAt": iso_utc(datetime.now(timezone.utc)),
+    }
 
-    finalize_field_parent_from_hourly(field["id"], mark_full_backfill_complete=is_complete)
+    update_payload = {
+        "hoursDone": new_hours_done,
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+        "lastChunkSummary": last_chunk_summary,
+        "error": None if fail == 0 else failures[:10],
+        "status": "done" if finished else "queued",
+    }
+
+    if finished:
+        update_payload["finishedAt"] = firestore.SERVER_TIMESTAMP
+
+    job_doc.reference.set(update_payload, merge=True)
+
+    finalized = None
+    if finished:
+        finalized = finalize_field_parent_from_hourly(field_id, mark_full_backfill_complete=True)
 
     return {
-        "fieldId": field["id"],
+        "processed": True,
+        "jobId": job_doc.id,
+        "status": "done" if finished else "queued",
+        "fieldId": field_id,
         "fieldName": field.get("name"),
-        "jobType": "full_backfill",
-        "anchorHourUtc": iso_utc(anchor_dt),
-        "hoursTotal": hours_total,
+        "mode": mode,
+        "radiusMiles": radius_miles,
         "hoursDoneBefore": hours_done,
         "hoursDoneAfter": new_hours_done,
-        "chunkHoursRequested": chunk_hours,
-        "chunkHoursProcessed": processed_slots,
-        "isComplete": is_complete,
-        "ok": ok,
-        "skippedNoFile": skipped,
-        "fail": fail,
-        "failures": failures[:50],
+        "hoursTotal": total_hours,
+        "chunkHours": chunk_hours,
+        "chunk": last_chunk_summary,
+        "finalized": finalized,
+        "failures": failures[:25],
     }
 
 
-def repair_field_range(field_id, start_hour_utc, end_hour_utc, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
-    field = get_field_by_id(field_id)
-    if not field:
-        raise RuntimeError("Field not found")
-
-    if mode not in {"single", "weighted"}:
-        raise RuntimeError("mode must be 'single' or 'weighted'")
-    if radius_miles <= 0:
-        raise RuntimeError("radiusMiles must be > 0")
-
-    start_dt = floor_to_hour_utc(parse_iso_utc(start_hour_utc))
-    end_dt = floor_to_hour_utc(parse_iso_utc(end_hour_utc))
-
-    if end_dt < start_dt:
-        raise RuntimeError("endHourUtc must be >= startHourUtc")
-
-    parent_ref = get_db().collection(MRMS_PARENT_COLLECTION).document(field["id"])
-
-    ok = 0
-    skipped = 0
-    fail = 0
-    failures = []
-
-    cur = start_dt
-    while cur <= end_dt:
-        product, s3_key, checked = pick_best_key_for_hour(cur)
-
-        if not s3_key:
-            skipped += 1
-            cur += timedelta(hours=1)
-            continue
-
-        try:
-            meta = get_dataset_for_key_uncached(product, s3_key)
-            meta["checkedProducts"] = checked
-            da = meta["dataArray"]
-
-            result = build_single_result(da, field["lat"], field["lng"]) if mode == "single" else build_weighted_result(da, field["lat"], field["lng"], radius_miles)
-
-            hour_id = hour_doc_id_from_iso(meta["fileTimestampUtc"])
-            hour_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION).document(hour_id)
-            history_entry = build_hour_history_entry(meta, mode, radius_miles, result)
-            hour_ref.set(history_entry, merge=True)
-            ok += 1
-        except Exception as e:
-            fail += 1
-            failures.append({
-                "targetHourUtc": iso_utc(cur),
-                "error": str(e),
-            })
-
-        cur += timedelta(hours=1)
-
-    finalize_field_parent_from_hourly(field["id"], mark_full_backfill_complete=False)
-
-    return {
-        "fieldId": field["id"],
-        "fieldName": field.get("name"),
-        "jobType": "repair_gap",
-        "startHourUtc": iso_utc(start_dt),
-        "endHourUtc": iso_utc(end_dt),
-        "ok": ok,
-        "skippedNoFile": skipped,
-        "fail": fail,
-        "failures": failures[:50],
-    }
-
-
-def repair_field_range_chunk(field_id, start_hour_utc, end_hour_utc, cursor_hour_utc=None, chunk_hours=DEFAULT_REPAIR_CHUNK_HOURS, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES, deadline_ts=None):
-    field = get_field_by_id(field_id)
-    if not field:
-        raise RuntimeError("Field not found")
-
-    if mode not in {"single", "weighted"}:
-        raise RuntimeError("mode must be 'single' or 'weighted'")
-    if radius_miles <= 0:
-        raise RuntimeError("radiusMiles must be > 0")
-
-    start_dt = floor_to_hour_utc(parse_iso_utc(start_hour_utc))
-    end_dt = floor_to_hour_utc(parse_iso_utc(end_hour_utc))
-    if end_dt < start_dt:
-        raise RuntimeError("endHourUtc must be >= startHourUtc")
-
-    cur = floor_to_hour_utc(parse_iso_utc(cursor_hour_utc)) if cursor_hour_utc else start_dt
-    if cur < start_dt:
-        cur = start_dt
-    if cur > end_dt:
-        finalize_field_parent_from_hourly(field["id"], mark_full_backfill_complete=False)
-        return {
-            "fieldId": field["id"],
-            "fieldName": field.get("name"),
-            "jobType": "repair_gap",
-            "startHourUtc": iso_utc(start_dt),
-            "endHourUtc": iso_utc(end_dt),
-            "cursorHourUtcBefore": iso_utc(cur),
-            "cursorHourUtcAfter": None,
-            "isComplete": True,
-            "chunkHoursRequested": int(clamp(chunk_hours, 1, 168)),
-            "chunkHoursProcessed": 0,
-            "ok": 0,
-            "skippedNoFile": 0,
-            "fail": 0,
-            "failures": [],
-        }
-
-    chunk_hours = int(clamp(chunk_hours, 1, 168))
-    processed_slots = 0
-
-    parent_ref = get_db().collection(MRMS_PARENT_COLLECTION).document(field["id"])
-
-    ok = 0
-    skipped = 0
-    fail = 0
-    failures = []
-
-    cursor_before = cur
-
-    while cur <= end_dt and processed_slots < chunk_hours:
-        if deadline_ts is not None and time.time() >= deadline_ts:
-            break
-
-        product, s3_key, checked = pick_best_key_for_hour(cur)
-
-        if not s3_key:
-            skipped += 1
-            processed_slots += 1
-            cur += timedelta(hours=1)
-            continue
-
-        try:
-            meta = get_dataset_for_key_uncached(product, s3_key)
-            meta["checkedProducts"] = checked
-            da = meta["dataArray"]
-
-            result = build_single_result(da, field["lat"], field["lng"]) if mode == "single" else build_weighted_result(da, field["lat"], field["lng"], radius_miles)
-
-            hour_id = hour_doc_id_from_iso(meta["fileTimestampUtc"])
-            hour_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION).document(hour_id)
-            history_entry = build_hour_history_entry(meta, mode, radius_miles, result)
-            hour_ref.set(history_entry, merge=True)
-            ok += 1
-        except Exception as e:
-            fail += 1
-            failures.append({
-                "targetHourUtc": iso_utc(cur),
-                "error": str(e),
-            })
-
-        processed_slots += 1
-        cur += timedelta(hours=1)
-
-    is_complete = cur > end_dt
-    finalize_field_parent_from_hourly(field["id"], mark_full_backfill_complete=False)
-
-    return {
-        "fieldId": field["id"],
-        "fieldName": field.get("name"),
-        "jobType": "repair_gap",
-        "startHourUtc": iso_utc(start_dt),
-        "endHourUtc": iso_utc(end_dt),
-        "cursorHourUtcBefore": iso_utc(cursor_before),
-        "cursorHourUtcAfter": None if is_complete else iso_utc(cur),
-        "isComplete": is_complete,
-        "chunkHoursRequested": chunk_hours,
-        "chunkHoursProcessed": processed_slots,
-        "ok": ok,
-        "skippedNoFile": skipped,
-        "fail": fail,
-        "failures": failures[:50],
-    }
-
-
-def claim_next_backfill():
+def process_next_repair_gap():
     db = get_db()
-    queue_ref = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION)
-
-    candidates = list(
-        queue_ref.where("status", "==", "queued").limit(200).stream()
-    )
-
-    if not candidates:
-        return None, None
-
-    def created_sort_value(doc_dict):
-        created = doc_dict.get("createdAt")
-        if created is None:
-            return datetime.max.replace(tzinfo=timezone.utc)
-
-        try:
-            if isinstance(created, datetime):
-                return created if created.tzinfo else created.replace(tzinfo=timezone.utc)
-
-            if hasattr(created, "datetime"):
-                dt = created.datetime
-                return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-
-            if hasattr(created, "to_datetime"):
-                dt = created.to_datetime()
-                return dt if dt.tzinfo else dt.replace(tzinfo=timezone.utc)
-        except Exception:
-            pass
-
-        return datetime.max.replace(tzinfo=timezone.utc)
-
-    def job_priority(doc_dict):
-        job_type = str(doc_dict.get("jobType") or "full_backfill").strip().lower()
-        if job_type == "full_backfill":
-            return 0
-        if job_type == "repair_gap":
-            return 1
-        return 9
-
-    enriched = []
-    for doc in candidates:
-        d = doc.to_dict() or {}
-        enriched.append((job_priority(d), created_sort_value(d), doc, d))
-
-    enriched.sort(key=lambda x: (x[0], x[1]))
-
-    doc = enriched[0][2]
-    ref = doc.reference
-
-    @firestore.transactional
-    def txn_claim(transaction, doc_ref):
-        snap = doc_ref.get(transaction=transaction)
-        if not snap.exists:
-            return None
-        d = snap.to_dict() or {}
-        if str(d.get("status") or "").strip().lower() != "queued":
-            return None
-
-        transaction.set(doc_ref, {
-            "status": "running",
-            "startedAt": firestore.SERVER_TIMESTAMP,
-            "updatedAt": firestore.SERVER_TIMESTAMP,
-            "error": None,
-        }, merge=True)
-        return d
-
-    transaction = db.transaction()
-    claimed_doc = txn_claim(transaction, ref)
-    if not claimed_doc:
-        return None, None
-
-    return ref, claimed_doc
-
-
-def process_one_backfill_job():
-    ref, queued = claim_next_backfill()
-    if not ref:
-        return {"processed": False, "message": "No queued backfill jobs found"}
-
-    job_type = str(queued.get("jobType") or "full_backfill").strip().lower()
-    field_id = queued.get("fieldId")
-    mode = str(queued.get("mode") or "weighted").strip().lower()
-    radius_miles = num(queued.get("radiusMiles")) or DEFAULT_RADIUS_MILES
-    deadline_ts = time.time() + (DEFAULT_BACKFILL_MAX_MINUTES_PER_RUN * 60.0) - 20.0
-
-    try:
-        if job_type == "repair_gap":
-            start_hour_utc = str(queued.get("startHourUtc") or "").strip()
-            end_hour_utc = str(queued.get("endHourUtc") or "").strip()
-            if not start_hour_utc or not end_hour_utc:
-                raise RuntimeError("repair_gap queue item missing startHourUtc/endHourUtc")
-
-            cursor_hour_utc = str(queued.get("repairCursorHourUtc") or start_hour_utc).strip()
-            chunk_hours = int(clamp(queued.get("chunkHours") or DEFAULT_REPAIR_CHUNK_HOURS, 1, 168))
-
-            result = repair_field_range_chunk(
-                field_id=field_id,
-                start_hour_utc=start_hour_utc,
-                end_hour_utc=end_hour_utc,
-                cursor_hour_utc=cursor_hour_utc,
-                chunk_hours=chunk_hours,
-                mode=mode,
-                radius_miles=radius_miles,
-                deadline_ts=deadline_ts,
-            )
-
-            if result.get("isComplete"):
-                ref.set({
-                    "status": "done",
-                    "finishedAt": firestore.SERVER_TIMESTAMP,
-                    "updatedAt": firestore.SERVER_TIMESTAMP,
-                    "hoursDone": queued.get("hoursTotal") or result.get("chunkHoursProcessed"),
-                    "resultSummary": {
-                        "okHours": result.get("ok"),
-                        "skippedNoFile": result.get("skippedNoFile"),
-                        "failHours": result.get("fail"),
-                        "jobType": job_type,
-                    },
-                    "lastChunkSummary": {
-                        "cursorHourUtcBefore": result.get("cursorHourUtcBefore"),
-                        "cursorHourUtcAfter": result.get("cursorHourUtcAfter"),
-                        "chunkHoursProcessed": result.get("chunkHoursProcessed"),
-                        "okHours": result.get("ok"),
-                        "skippedNoFile": result.get("skippedNoFile"),
-                        "failHours": result.get("fail"),
-                    },
-                    "error": None,
-                }, merge=True)
-
-                return {"processed": True, "queueStatus": "done", "result": result}
-
-            hours_total = int(clamp(queued.get("hoursTotal") or 1, 1, 10000))
-            hours_done = int(clamp(queued.get("hoursDone") or 0, 0, hours_total))
-            new_hours_done = min(hours_total, hours_done + int(result.get("chunkHoursProcessed") or 0))
-
-            ref.set({
-                "status": "queued",
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-                "repairCursorHourUtc": result.get("cursorHourUtcAfter"),
-                "hoursDone": new_hours_done,
-                "lastChunkSummary": {
-                    "cursorHourUtcBefore": result.get("cursorHourUtcBefore"),
-                    "cursorHourUtcAfter": result.get("cursorHourUtcAfter"),
-                    "chunkHoursProcessed": result.get("chunkHoursProcessed"),
-                    "okHours": result.get("ok"),
-                    "skippedNoFile": result.get("skippedNoFile"),
-                    "failHours": result.get("fail"),
-                },
-                "error": None,
-            }, merge=True)
-
-            return {"processed": True, "queueStatus": "requeued", "result": result}
-
-        days = int(clamp(queued.get("days") or 30, 1, 30))
-        hours_total = int(clamp(queued.get("hoursTotal") or (days * 24), 1, KEEP_HOURS))
-        hours_done = int(clamp(queued.get("hoursDone") or 0, 0, hours_total))
-        chunk_hours = int(clamp(queued.get("chunkHours") or DEFAULT_FULL_BACKFILL_CHUNK_HOURS, 1, 168))
-        anchor_hour_utc = str(queued.get("anchorHourUtc") or iso_utc(floor_to_hour_utc(datetime.now(timezone.utc)))).strip()
-
-        result = backfill_field_chunk(
-            field_id=field_id,
-            anchor_hour_utc=anchor_hour_utc,
-            hours_total=hours_total,
-            hours_done=hours_done,
-            chunk_hours=chunk_hours,
-            mode=mode,
-            radius_miles=radius_miles,
-            deadline_ts=deadline_ts,
-        )
-
-        if result.get("isComplete"):
-            ref.set({
-                "status": "done",
-                "finishedAt": firestore.SERVER_TIMESTAMP,
-                "updatedAt": firestore.SERVER_TIMESTAMP,
-                "hoursDone": result.get("hoursDoneAfter"),
-                "resultSummary": {
-                    "okHours": result.get("ok"),
-                    "skippedNoFile": result.get("skippedNoFile"),
-                    "failHours": result.get("fail"),
-                    "jobType": job_type,
-                },
-                "lastChunkSummary": {
-                    "hoursDoneBefore": result.get("hoursDoneBefore"),
-                    "hoursDoneAfter": result.get("hoursDoneAfter"),
-                    "chunkHoursProcessed": result.get("chunkHoursProcessed"),
-                    "okHours": result.get("ok"),
-                    "skippedNoFile": result.get("skippedNoFile"),
-                    "failHours": result.get("fail"),
-                },
-                "error": None,
-            }, merge=True)
-
-            return {"processed": True, "queueStatus": "done", "result": result}
-
-        ref.set({
-            "status": "queued",
-            "updatedAt": firestore.SERVER_TIMESTAMP,
-            "hoursDone": result.get("hoursDoneAfter"),
-            "lastChunkSummary": {
-                "hoursDoneBefore": result.get("hoursDoneBefore"),
-                "hoursDoneAfter": result.get("hoursDoneAfter"),
-                "chunkHoursProcessed": result.get("chunkHoursProcessed"),
-                "okHours": result.get("ok"),
-                "skippedNoFile": result.get("skippedNoFile"),
-                "failHours": result.get("fail"),
-            },
-            "error": None,
-        }, merge=True)
-
-        return {"processed": True, "queueStatus": "requeued", "result": result}
-
-    except Exception as e:
-        print(f"[process_one_backfill_job] fieldId={field_id} jobType={job_type} ERROR: {e}", flush=True)
-        traceback.print_exc()
-        ref.set({
-            "status": "failed",
-            "finishedAt": firestore.SERVER_TIMESTAMP,
-            "updatedAt": firestore.SERVER_TIMESTAMP,
-            "error": str(e),
-        }, merge=True)
-        return {"processed": True, "queueStatus": "failed", "error": str(e), "fieldId": field_id, "jobType": job_type}
-
-
-def process_next_backfill(max_fields=None, max_minutes=None):
-    max_fields = int(clamp(max_fields if max_fields is not None else DEFAULT_BACKFILL_MAX_FIELDS_PER_RUN, 1, 100000))
-    max_minutes = float(clamp(max_minutes if max_minutes is not None else DEFAULT_BACKFILL_MAX_MINUTES_PER_RUN, 1, 55))
-
-    start = time.time()
-    processed_count = 0
-    done_count = 0
-    failed_count = 0
-    requeued_count = 0
-    results = []
-
-    while True:
-        elapsed_minutes = (time.time() - start) / 60.0
-        if processed_count >= max_fields:
-            break
-        if elapsed_minutes >= max_minutes:
-            break
-
-        one = process_one_backfill_job()
-        if not one.get("processed"):
-            break
-
-        processed_count += 1
-        if one.get("queueStatus") == "done":
-            done_count += 1
-        elif one.get("queueStatus") == "failed":
-            failed_count += 1
-        elif one.get("queueStatus") == "requeued":
-            requeued_count += 1
-
-        results.append(one)
-
-    remaining = queue_counts()
-
-    return {
-        "processed": processed_count > 0,
-        "processedCount": processed_count,
-        "doneCount": done_count,
-        "failedCount": failed_count,
-        "requeuedCount": requeued_count,
-        "elapsedMinutes": round_num((time.time() - start) / 60.0, 2),
-        "stoppedReason": (
-            "queue_empty" if remaining["queued"] == 0 else
-            "max_fields_reached" if processed_count >= max_fields else
-            "max_minutes_reached"
-        ),
-        "maxFields": max_fields,
-        "maxMinutes": max_minutes,
-        "remaining": remaining,
-        "results": results,
-    }
-
-
-def queue_status(limit=50):
-    db = get_db()
-    docs = list(
+    queued = list(
         db.collection(MRMS_BACKFILL_QUEUE_COLLECTION)
-        .order_by("createdAt", direction=firestore.Query.DESCENDING)
-        .limit(limit)
+        .where("status", "==", "queued")
+        .limit(25)
         .stream()
     )
-    rows = []
-    for doc in docs:
-        d = doc.to_dict() or {}
-        rows.append({
-            "docId": doc.id,
-            "jobType": d.get("jobType") or "full_backfill",
-            "fieldId": d.get("fieldId") or doc.id,
-            "fieldName": d.get("fieldName"),
-            "status": d.get("status"),
-            "days": d.get("days"),
-            "mode": d.get("mode"),
-            "radiusMiles": d.get("radiusMiles"),
-            "startHourUtc": d.get("startHourUtc"),
-            "endHourUtc": d.get("endHourUtc"),
-            "anchorHourUtc": d.get("anchorHourUtc"),
-            "repairCursorHourUtc": d.get("repairCursorHourUtc"),
-            "hoursTotal": d.get("hoursTotal"),
-            "hoursDone": d.get("hoursDone"),
-            "chunkHours": d.get("chunkHours"),
-            "lastChunkSummary": d.get("lastChunkSummary"),
-            "error": d.get("error"),
-            "resetReason": d.get("resetReason"),
-        })
-    return rows
 
+    repair_doc = None
+    repair_job = None
+    for doc in queued:
+        job = doc.to_dict() or {}
+        if str(job.get("jobType") or "").strip().lower() == "repair_gap":
+            repair_doc = doc
+            repair_job = job
+            break
 
-def queue_counts():
-    db = get_db()
-    out = {"queued": 0, "running": 0, "done": 0, "failed": 0}
-    for status in out.keys():
-        docs = list(
-            db.collection(MRMS_BACKFILL_QUEUE_COLLECTION)
-            .where("status", "==", status)
-            .limit(10000)
-            .stream()
-        )
-        out[status] = len(docs)
-    return out
+    if not repair_doc:
+        return {
+            "processed": False,
+            "reason": "no_queued_repair_gap_jobs",
+        }
+
+    field_id = repair_job.get("fieldId")
+    mode = repair_job.get("mode") or "weighted"
+    radius_miles = num(repair_job.get("radiusMiles")) or DEFAULT_RADIUS_MILES
+    chunk_hours = int(clamp(repair_job.get("chunkHours") or DEFAULT_REPAIR_CHUNK_HOURS, 1, 168))
+    start_hour_utc = repair_job.get("startHourUtc")
+    end_hour_utc = repair_job.get("endHourUtc")
+    cursor_hour_utc = repair_job.get("repairCursorHourUtc") or start_hour_utc
+
+    field = get_field_by_id(field_id)
+    if not field:
+        repair_doc.reference.set({
+            "status": "failed",
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "finishedAt": firestore.SERVER_TIMESTAMP,
+            "error": "Field not found",
+        }, merge=True)
+        return {
+            "processed": False,
+            "jobId": repair_doc.id,
+            "status": "failed",
+            "reason": "field_not_found",
+        }
+
+    start_dt = floor_to_hour_utc(parse_iso_utc(start_hour_utc))
+    end_dt = floor_to_hour_utc(parse_iso_utc(end_hour_utc))
+    cursor_dt = floor_to_hour_utc(parse_iso_utc(cursor_hour_utc))
+
+    if cursor_dt < start_dt:
+        cursor_dt = start_dt
+
+    if cursor_dt > end_dt:
+        repair_doc.reference.set({
+            "status": "done",
+            "updatedAt": firestore.SERVER_TIMESTAMP,
+            "finishedAt": firestore.SERVER_TIMESTAMP,
+        }, merge=True)
+        finalized = finalize_field_parent_from_hourly(field_id, mark_full_backfill_complete=False)
+        return {
+            "processed": True,
+            "jobId": repair_doc.id,
+            "status": "done",
+            "fieldId": field_id,
+            "fieldName": field.get("name"),
+            "finalized": finalized,
+        }
+
+    repair_doc.reference.set({
+        "status": "running",
+        "startedAt": firestore.SERVER_TIMESTAMP if not repair_job.get("startedAt") else repair_job.get("startedAt"),
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+    }, merge=True)
+
+    parent_ref = db.collection(MRMS_PARENT_COLLECTION).document(field["id"])
+
+    ok = 0
+    skipped = 0
+    fail = 0
+    failures = []
+    processed_hours = 0
+
+    current_dt = cursor_dt
+    final_dt_this_chunk = min(end_dt, cursor_dt + timedelta(hours=chunk_hours - 1))
+
+    while current_dt <= final_dt_this_chunk:
+        product, s3_key, checked = pick_best_key_for_hour(current_dt)
+
+        if not s3_key:
+            skipped += 1
+            processed_hours += 1
+            current_dt += timedelta(hours=1)
+            continue
+
+        try:
+            meta = get_dataset_for_key_uncached(product, s3_key)
+            meta["checkedProducts"] = checked
+            da = meta["dataArray"]
+
+            result = build_single_result(da, field["lat"], field["lng"]) if mode == "single" else build_weighted_result(da, field["lat"], field["lng"], radius_miles)
+
+            hour_id = hour_doc_id_from_iso(meta["fileTimestampUtc"])
+            hour_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION).document(hour_id)
+            write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, result)
+            ok += 1
+            processed_hours += 1
+
+            try:
+                if meta.get("io") is not None:
+                    meta["io"].close()
+            except Exception:
+                pass
+
+        except Exception as e:
+            fail += 1
+            processed_hours += 1
+            failures.append({
+                "targetHourUtc": iso_utc(current_dt),
+                "error": str(e),
+            })
+
+        current_dt += timedelta(hours=1)
+
+    next_cursor = final_dt_this_chunk + timedelta(hours=1)
+    finished = next_cursor > end_dt
+    hours_done = int(num(repair_job.get("hoursDone")) or 0) + processed_hours
+
+    last_chunk_summary = {
+        "processedHours": processed_hours,
+        "ok": ok,
+        "skipped": skipped,
+        "fail": fail,
+        "finished": finished,
+        "updatedAt": iso_utc(datetime.now(timezone.utc)),
+    }
+
+    update_payload = {
+        "hoursDone": hours_done,
+        "repairCursorHourUtc": iso_utc(next_cursor),
+        "updatedAt": firestore.SERVER_TIMESTAMP,
+        "lastChunkSummary": last_chunk_summary,
+        "error": None if fail == 0 else failures[:10],
+        "status": "done" if finished else "queued",
+    }
+
+    if finished:
+        update_payload["finishedAt"] = firestore.SERVER_TIMESTAMP
+
+    repair_doc.reference.set(update_payload, merge=True)
+
+    finalized = None
+    if finished:
+        finalized = finalize_field_parent_from_hourly(field_id, mark_full_backfill_complete=False)
+
+    return {
+        "processed": True,
+        "jobId": repair_doc.id,
+        "status": "done" if finished else "queued",
+        "fieldId": field_id,
+        "fieldName": field.get("name"),
+        "mode": mode,
+        "radiusMiles": radius_miles,
+        "startHourUtc": iso_utc(start_dt),
+        "endHourUtc": iso_utc(end_dt),
+        "cursorBefore": iso_utc(cursor_dt),
+        "cursorAfter": iso_utc(next_cursor),
+        "chunkHours": chunk_hours,
+        "chunk": last_chunk_summary,
+        "finalized": finalized,
+        "failures": failures[:25],
+    }
 
 
 @app.get("/")
@@ -2168,206 +2009,290 @@ def root():
             "backfillField": "/backfill-field?fieldId=YOUR_FIELD_ID&days=30&mode=weighted&radiusMiles=0.5",
             "enqueueBackfill": "/enqueue-backfill?fieldId=YOUR_FIELD_ID&days=30&mode=weighted&radiusMiles=0.5",
             "enqueueBackfillAll": "/enqueue-backfill-all?days=30&mode=weighted&radiusMiles=0.5",
-            "processNextBackfill": "/process-next-backfill?maxFields=1&maxMinutes=4",
+            "processNextBackfill": "/process-next-backfill",
             "queueStatus": "/queue-status",
-        },
+            "repairField": "/repair-field?fieldId=YOUR_FIELD_ID&lookbackHours=24&mode=weighted&radiusMiles=0.5",
+            "processNextRepair": "/process-next-repair",
+            "fieldState": "/field-state?fieldId=YOUR_FIELD_ID",
+        }
+    })
+
+
+@app.get("/health")
+def health():
+    return jsonify({
+        "ok": IMPORT_ERROR is None,
+        "importError": IMPORT_ERROR,
+        "productPriority": PRODUCT_PRIORITY,
+        "repairLookbackHours": DEFAULT_REPAIR_LOOKBACK_HOURS,
+        "fullBackfillChunkHours": DEFAULT_FULL_BACKFILL_CHUNK_HOURS,
+        "repairChunkHours": DEFAULT_REPAIR_CHUNK_HOURS,
+        "locationEpsilon": LOCATION_EPSILON,
     })
 
 
 @app.get("/api/mrms-1h")
 def api_mrms_1h():
     try:
+        ensure_runtime_ready()
+
         lat = num(request.args.get("lat"))
         lon = num(request.args.get("lon"))
+        mode = (request.args.get("mode") or "weighted").strip().lower()
         radius_miles = num(request.args.get("radiusMiles")) or DEFAULT_RADIUS_MILES
-        mode = (request.args.get("mode") or "single").strip().lower()
 
-        validate_point(lat, lon)
-
-        if radius_miles <= 0:
-            return jsonify({"ok": False, "error": "radiusMiles must be > 0"}), 400
+        if lat is None or lon is None:
+            return jsonify({"ok": False, "error": "lat and lon are required"}), 400
         if mode not in {"single", "weighted"}:
             return jsonify({"ok": False, "error": "mode must be 'single' or 'weighted'"}), 400
+        if radius_miles <= 0:
+            return jsonify({"ok": False, "error": "radiusMiles must be > 0"}), 400
 
         meta = get_cached_dataset()
         da = meta["dataArray"]
+
         result = build_single_result(da, lat, lon) if mode == "single" else build_weighted_result(da, lat, lon, radius_miles)
 
         return jsonify({
             "ok": True,
             "source": "noaa-mrms-aws",
-            "mode": mode,
-            "units": "mm",
             "selectedProduct": meta["selectedProduct"],
             "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
             "fileTimestampUtc": meta["fileTimestampUtc"],
             "variableName": meta["variableName"],
+            "mode": mode,
+            "radiusMiles": radius_miles if mode == "weighted" else None,
             "cacheHit": meta["cacheHit"],
-            "checkedProducts": meta["checkedProducts"],
-            "io": meta["io"],
+            "checkedProducts": meta.get("checkedProducts"),
+            "lat": lat,
+            "lon": lon,
+            "rainMm": extract_rain_value(mode, result),
             "result": result,
         })
+
     except Exception as e:
-        print(f"[api/mrms-1h] ERROR: {e}", flush=True)
-        traceback.print_exc()
-        return jsonify({"ok": False, "error": str(e)}), 500
-
-
-@app.get("/api/mrms-bulk")
-def api_mrms_bulk_get():
-    try:
-        points_str = request.args.get("points", "")
-        mode = (request.args.get("mode") or "single").strip().lower()
-        radius_miles = num(request.args.get("radiusMiles")) or DEFAULT_RADIUS_MILES
-
-        points = parse_bulk_points_from_query(points_str)
-        if not points:
-            return jsonify({"ok": False, "error": "No points provided"}), 400
-        if len(points) > MAX_BULK_POINTS:
-            return jsonify({"ok": False, "error": f"Too many points. Max {MAX_BULK_POINTS}"}), 400
-        if mode not in {"single", "weighted"}:
-            return jsonify({"ok": False, "error": "mode must be 'single' or 'weighted'"}), 400
-        if radius_miles <= 0:
-            return jsonify({"ok": False, "error": "radiusMiles must be > 0"}), 400
-
-        meta = get_cached_dataset()
-        da = meta["dataArray"]
-
-        results = []
-        total_grid_samples = 0
-
-        for idx, p in enumerate(points):
-            validate_point(p["lat"], p["lon"])
-            result = build_single_result(da, p["lat"], p["lon"]) if mode == "single" else build_weighted_result(da, p["lat"], p["lon"], radius_miles)
-            total_grid_samples += 1 if mode == "single" else 6
-            results.append({"index": idx, **result})
-
-        return jsonify({
-            "ok": True,
-            "source": "noaa-mrms-aws",
-            "mode": mode,
-            "units": "mm",
-            "selectedProduct": meta["selectedProduct"],
-            "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
-            "fileTimestampUtc": meta["fileTimestampUtc"],
-            "variableName": meta["variableName"],
-            "cacheHit": meta["cacheHit"],
-            "checkedProducts": meta["checkedProducts"],
-            "io": meta["io"],
-            "pointCount": len(points),
-            "totalGridSamples": total_grid_samples,
-            "results": results,
-        })
-    except Exception as e:
-        print(f"[api/mrms-bulk] ERROR: {e}", flush=True)
-        traceback.print_exc()
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
 
 
 @app.get("/run")
-def run_batch():
+def run_route():
     try:
         mode = (request.args.get("mode") or "weighted").strip().lower()
         radius_miles = num(request.args.get("radiusMiles")) or DEFAULT_RADIUS_MILES
         out = run_batch_cache(mode=mode, radius_miles=radius_miles)
-        return jsonify({
-            "ok": True,
-            "mode": mode,
-            "radiusMiles": radius_miles if mode == "weighted" else None,
-            "writesToCollection": MRMS_PARENT_COLLECTION,
-            "historySubcollection": MRMS_HOURLY_SUBCOLLECTION,
-            "rainUnit": "mm",
-            "result": out,
-        })
+        return jsonify({"ok": True, **out})
     except Exception as e:
-        print(f"[/run] ERROR: {e}", flush=True)
-        traceback.print_exc()
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
 
 
 @app.get("/backfill-field")
 def backfill_field_route():
     try:
-        field_id = str(request.args.get("fieldId") or "").strip()
-        days = int(clamp(request.args.get("days") or 30, 1, 30))
+        field_id = (request.args.get("fieldId") or "").strip()
+        days = int(request.args.get("days") or KEEP_DAYS)
         mode = (request.args.get("mode") or "weighted").strip().lower()
         radius_miles = num(request.args.get("radiusMiles")) or DEFAULT_RADIUS_MILES
 
         if not field_id:
-            return jsonify({"ok": False, "error": "Missing fieldId"}), 400
+            return jsonify({"ok": False, "error": "fieldId is required"}), 400
 
-        out = backfill_field(field_id=field_id, days=days, mode=mode, radius_miles=radius_miles)
-        return jsonify({"ok": True, "mode": mode, "radiusMiles": radius_miles if mode == "weighted" else None, "rainUnit": "mm", "result": out})
+        out = backfill_field(
+            field_id=field_id,
+            days=days,
+            mode=mode,
+            radius_miles=radius_miles,
+        )
+        return jsonify({"ok": True, **out})
     except Exception as e:
-        print(f"[/backfill-field] ERROR: {e}", flush=True)
-        traceback.print_exc()
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
 
 
 @app.get("/enqueue-backfill")
 def enqueue_backfill_route():
     try:
-        field_id = str(request.args.get("fieldId") or "").strip()
-        days = int(clamp(request.args.get("days") or 30, 1, 30))
+        field_id = (request.args.get("fieldId") or "").strip()
+        days = int(request.args.get("days") or KEEP_DAYS)
         mode = (request.args.get("mode") or "weighted").strip().lower()
         radius_miles = num(request.args.get("radiusMiles")) or DEFAULT_RADIUS_MILES
 
         if not field_id:
-            return jsonify({"ok": False, "error": "Missing fieldId"}), 400
+            return jsonify({"ok": False, "error": "fieldId is required"}), 400
 
-        out = enqueue_backfill(field_id=field_id, days=days, mode=mode, radius_miles=radius_miles)
-        return jsonify({"ok": True, "result": out})
+        out = enqueue_backfill(
+            field_id=field_id,
+            days=days,
+            mode=mode,
+            radius_miles=radius_miles,
+        )
+        return jsonify({"ok": True, **out})
     except Exception as e:
-        print(f"[/enqueue-backfill] ERROR: {e}", flush=True)
-        traceback.print_exc()
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
 
 
 @app.get("/enqueue-backfill-all")
 def enqueue_backfill_all_route():
     try:
-        days = int(clamp(request.args.get("days") or 30, 1, 30))
+        days = int(request.args.get("days") or KEEP_DAYS)
         mode = (request.args.get("mode") or "weighted").strip().lower()
         radius_miles = num(request.args.get("radiusMiles")) or DEFAULT_RADIUS_MILES
 
-        out = enqueue_backfill_all(days=days, mode=mode, radius_miles=radius_miles)
-        return jsonify({"ok": True, "result": out})
+        out = enqueue_backfill_all(
+            days=days,
+            mode=mode,
+            radius_miles=radius_miles,
+        )
+        return jsonify({"ok": True, **out})
     except Exception as e:
-        print(f"[/enqueue-backfill-all] ERROR: {e}", flush=True)
-        traceback.print_exc()
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
 
 
 @app.get("/process-next-backfill")
 def process_next_backfill_route():
     try:
-        max_fields = request.args.get("maxFields")
-        max_minutes = request.args.get("maxMinutes")
-        out = process_next_backfill(max_fields=max_fields, max_minutes=max_minutes)
-        return jsonify({"ok": True, "result": out})
+        out = process_next_backfill()
+        return jsonify({"ok": True, **out})
     except Exception as e:
-        print(f"[process-next-backfill] ERROR: {e}", flush=True)
-        traceback.print_exc()
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.get("/repair-field")
+def repair_field_route():
+    try:
+        field_id = (request.args.get("fieldId") or "").strip()
+        lookback_hours = int(request.args.get("lookbackHours") or DEFAULT_REPAIR_LOOKBACK_HOURS)
+        mode = (request.args.get("mode") or "weighted").strip().lower()
+        radius_miles = num(request.args.get("radiusMiles")) or DEFAULT_RADIUS_MILES
+
+        if not field_id:
+            return jsonify({"ok": False, "error": "fieldId is required"}), 400
+
+        field = get_field_by_id(field_id)
+        if not field:
+            return jsonify({"ok": False, "error": "Field not found"}), 404
+
+        meta = get_cached_dataset()
+        missing = find_missing_recent_hours(
+            field_id=field_id,
+            latest_hour_utc=meta["fileTimestampUtc"],
+            lookback_hours=lookback_hours,
+        )
+
+        if not missing:
+            return jsonify({
+                "ok": True,
+                "fieldId": field_id,
+                "fieldName": field.get("name"),
+                "queued": False,
+                "reason": "no_gap",
+                "lookbackHours": lookback_hours,
+                "latestHourUtc": meta["fileTimestampUtc"],
+            })
+
+        out = enqueue_gap_repair(
+            field_id=field_id,
+            start_hour_utc=missing[0],
+            end_hour_utc=missing[-1],
+            mode=mode,
+            radius_miles=radius_miles,
+        )
+        return jsonify({
+            "ok": True,
+            "fieldId": field_id,
+            "fieldName": field.get("name"),
+            "queued": True,
+            "lookbackHours": lookback_hours,
+            "latestHourUtc": meta["fileTimestampUtc"],
+            "missingCount": len(missing),
+            "queue": out,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.get("/process-next-repair")
+def process_next_repair_route():
+    try:
+        out = process_next_repair_gap()
+        return jsonify({"ok": True, **out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
 
 
 @app.get("/queue-status")
 def queue_status_route():
     try:
-        limit = int(clamp(request.args.get("limit") or 50, 1, 200))
-        out = queue_status(limit=limit)
+        db = get_db()
+        rows = []
+
+        docs = db.collection(MRMS_BACKFILL_QUEUE_COLLECTION).stream()
+        for doc in docs:
+            d = doc.to_dict() or {}
+            rows.append({
+                "id": doc.id,
+                "jobType": d.get("jobType"),
+                "fieldId": d.get("fieldId"),
+                "fieldName": d.get("fieldName"),
+                "status": d.get("status"),
+                "days": d.get("days"),
+                "mode": d.get("mode"),
+                "radiusMiles": d.get("radiusMiles"),
+                "hoursTotal": d.get("hoursTotal"),
+                "hoursDone": d.get("hoursDone"),
+                "chunkHours": d.get("chunkHours"),
+                "startHourUtc": d.get("startHourUtc"),
+                "endHourUtc": d.get("endHourUtc"),
+                "repairCursorHourUtc": d.get("repairCursorHourUtc"),
+                "createdAt": d.get("createdAt"),
+                "updatedAt": d.get("updatedAt"),
+                "startedAt": d.get("startedAt"),
+                "finishedAt": d.get("finishedAt"),
+                "error": d.get("error"),
+                "lastChunkSummary": d.get("lastChunkSummary"),
+            })
+
+        rows.sort(key=lambda x: (
+            str(x.get("status") or ""),
+            str(x.get("jobType") or ""),
+            str(x.get("fieldName") or ""),
+            str(x.get("id") or ""),
+        ))
+
         return jsonify({
             "ok": True,
             "queueCollection": MRMS_BACKFILL_QUEUE_COLLECTION,
-            "counts": queue_counts(),
-            "items": out
+            "count": len(rows),
+            "rows": rows,
         })
     except Exception as e:
-        print(f"[/queue-status] ERROR: {e}", flush=True)
-        traceback.print_exc()
-        return jsonify({"ok": False, "error": str(e)}), 500
+        return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
 
+
+@app.get("/field-state")
+def field_state_route():
+    try:
+        field_id = (request.args.get("fieldId") or "").strip()
+        if not field_id:
+            return jsonify({"ok": False, "error": "fieldId is required"}), 400
+
+        field = get_field_by_id(field_id)
+        if not field:
+            return jsonify({"ok": False, "error": "Field not found"}), 404
+
+        state = get_field_mrms_state(field_id)
+        return jsonify({
+            "ok": True,
+            "fieldId": field_id,
+            "fieldName": field.get("name"),
+            "state": state,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
+
+
+# ---------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    app.run(host="0.0.0.0", port=port)
+    port = int(os.environ.get("PORT", "8080"))
+    app.run(host="0.0.0.0", port=port, debug=False)

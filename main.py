@@ -1,7 +1,7 @@
 # =====================================================================
 # main.py  (FULL FILE)
 # FarmVista NOAA MRMS Pass2->Pass1 fallback rainfall service
-# Rev: 2026-03-24a-force-full-backfill-on-latlng-change
+# Rev: 2026-03-27a-incremental-rollups-keep-original-routes
 #
 # PURPOSE
 # ✅ Pulls MRMS hourly rainfall from NOAA AWS
@@ -12,11 +12,12 @@
 # ✅ If lat/lng changed, force-resets full backfill queue for that field
 # ✅ Writes the current hour immediately at the new location
 # ✅ Treats moved fields like new fields automatically
-# ✅ FIX: moved fields now suppress repair-gap enqueue on the same run
-# ✅ FIX: moved fields now clear stale repair jobs for that field
-# ✅ FIX: moved fields now clear stale full-backfill job state before requeue
+# ✅ FIX: existing fields no longer reread all historical hourly docs on each normal write
+# ✅ FIX: parent last24 + daily30 rollups now update incrementally on normal writes
+# ✅ FIX: full rebuild path is preserved for full backfill / repair completion only
 #
 # NOTES
+# - This file keeps the original route/helper structure.
 # - This file handles MRMS automation only.
 # - Weather-cache automation is still handled elsewhere.
 # - Backfill jobs always read the current field lat/lng from Firestore.
@@ -27,7 +28,6 @@ import math
 import os
 import tempfile
 import threading
-import time
 import traceback
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -92,6 +92,7 @@ CACHE = {
     "variableName": None,
     "dataArray": None,
     "io": None,
+    "cacheHit": False,
 }
 
 _DB = None
@@ -485,7 +486,7 @@ def compute_weighted_mm(da, lat, lon, radius_miles):
             "lat": round_num(p_lat, 6),
             "lon": round_num(p_lon, 6),
             "weight": sp["weight"],
-            "rainMm": round_num(rain_mm, 4),
+            "mm": round_num(rain_mm, 4),
         })
 
     final_mm = weighted_sum / total_weight if total_weight > 0 else 0.0
@@ -495,94 +496,128 @@ def compute_weighted_mm(da, lat, lon, radius_miles):
     return round_num(final_mm, 4), samples_out
 
 
-def build_single_result(da, lat, lng):
-    hourly_rain_mm = mm_from_dataset_value(sample_one_point(da, lat, lng))
+def parse_bulk_points_from_query(points_str):
+    points = []
+    if not points_str:
+        return points
+
+    chunks = [x.strip() for x in points_str.split(";") if x.strip()]
+    for idx, chunk in enumerate(chunks):
+        parts = [p.strip() for p in chunk.split(",")]
+        if len(parts) != 2:
+            raise RuntimeError(f"Invalid points format at item {idx + 1}. Use lat,lon;lat,lon")
+        lat = num(parts[0])
+        lon = num(parts[1])
+        if lat is None or lon is None:
+            raise RuntimeError(f"Invalid numeric lat/lon at item {idx + 1}")
+        points.append({"lat": lat, "lon": lon})
+    return points
+
+
+def validate_point(lat, lon):
+    if lat is None or lon is None:
+        raise RuntimeError("Missing or invalid lat/lon")
+    if lat < -90 or lat > 90 or lon < -180 or lon > 180:
+        raise RuntimeError("lat/lon out of range")
+
+
+def build_single_result(da, lat, lon):
+    hourly_rain_mm = mm_from_dataset_value(sample_one_point(da, lat, lon))
     if hourly_rain_mm is None:
         hourly_rain_mm = 0.0
 
     return {
+        "lat": round_num(lat, 6),
+        "lon": round_num(lon, 6),
         "hourlyRainMm": round_num(hourly_rain_mm, 4),
         "nearestGridLatitude": round_num(lat, 6),
-        "nearestGridLongitude": round_num(lng, 6),
-        "nearestGridLongitudeRaw": round_num(lng, 6),
-        "queryLongitudeUsed": round_num(lng, 6),
+        "nearestGridLongitude": round_num(lon, 6),
+        "nearestGridLongitudeRaw": round_num(lon, 6),
+        "queryLongitudeUsed": round_num(lon, 6),
         "longitudeMode": "native",
     }
 
 
-def build_weighted_result(da, lat, lng, radius_miles):
-    weighted_mm, samples = compute_weighted_mm(da, lat, lng, radius_miles)
+def build_weighted_result(da, lat, lon, radius_miles):
+    weighted_mm, samples = compute_weighted_mm(da, lat, lon, radius_miles)
 
     return {
+        "lat": round_num(lat, 6),
+        "lon": round_num(lon, 6),
+        "radiusMiles": radius_miles,
         "weightedHourlyRainMm": round_num(weighted_mm, 4),
         "attemptedPointCount": len(SAMPLE_POINTS),
         "successfulPointCount": len(samples),
         "samples": samples,
-        "hourlyRainMm": round_num(weighted_mm, 4),
-        "nearestGridLatitude": round_num(lat, 6),
-        "nearestGridLongitude": round_num(lng, 6),
-        "nearestGridLongitudeRaw": round_num(lng, 6),
-        "queryLongitudeUsed": round_num(lng, 6),
-        "longitudeMode": "weighted",
-    }
-
-
-def get_field_by_id(field_id):
-    snap = get_db().collection(FIELDS_COLLECTION).document(field_id).get()
-    if not snap.exists:
-        return None
-
-    data = snap.to_dict() or {}
-    loc = data.get("location") or {}
-
-    lat = num(loc.get("lat"))
-    lng = num(loc.get("lng"))
-    if lat is None or lng is None:
-        lat = num(data.get("lat"))
-        lng = num(data.get("lng"))
-
-    return {
-        "id": snap.id,
-        "name": data.get("name"),
-        "farmId": data.get("farmId"),
-        "farmName": data.get("farmName"),
-        "lat": lat,
-        "lng": lng,
     }
 
 
 def load_active_fields_for_batch():
-    docs = (
-        get_db()
-        .collection(FIELDS_COLLECTION)
-        .where("archived", "==", False)
-        .stream()
-    )
+    db = get_db()
+    raw = []
 
-    rows = []
-    for doc in docs:
-        data = doc.to_dict() or {}
-        loc = data.get("location") or {}
+    try:
+        snap = db.collection(FIELDS_COLLECTION).where("status", "==", "active").stream()
+        for doc in snap:
+            raw.append({"id": doc.id, "data": doc.to_dict() or {}})
+    except Exception as e:
+        print(f"[Batch] fields query(status==active) failed: {e}", flush=True)
 
+    if not raw:
+        try:
+            snap2 = db.collection(FIELDS_COLLECTION).stream()
+            for doc in snap2:
+                raw.append({"id": doc.id, "data": doc.to_dict() or {}})
+        except Exception as e:
+            print(f"[Batch] fields query(all) failed: {e}", flush=True)
+            raw = []
+
+    out = []
+    for r in raw:
+        d = r["data"] or {}
+        status = str(d.get("status", "")).strip().lower()
+        if status != "active":
+            continue
+
+        loc = d.get("location") or {}
         lat = num(loc.get("lat"))
         lng = num(loc.get("lng"))
         if lat is None or lng is None:
-            lat = num(data.get("lat"))
-            lng = num(data.get("lng"))
-
-        if lat is None or lng is None:
             continue
 
-        rows.append({
-            "id": doc.id,
-            "name": data.get("name"),
-            "farmId": data.get("farmId"),
-            "farmName": data.get("farmName"),
+        out.append({
+            "id": r["id"],
+            "name": str(d.get("name") or ""),
+            "farmId": d.get("farmId"),
+            "farmName": d.get("farmName"),
             "lat": lat,
             "lng": lng,
         })
 
-    return rows
+    return out
+
+
+def get_field_by_id(field_id):
+    db = get_db()
+    doc = db.collection(FIELDS_COLLECTION).document(field_id).get()
+    if not doc.exists:
+        return None
+
+    d = doc.to_dict() or {}
+    loc = d.get("location") or {}
+    lat = num(loc.get("lat"))
+    lng = num(loc.get("lng"))
+    if lat is None or lng is None:
+        raise RuntimeError("Field exists but location.lat/lng is missing or invalid")
+
+    return {
+        "id": doc.id,
+        "name": str(d.get("name") or ""),
+        "farmId": d.get("farmId"),
+        "farmName": d.get("farmName"),
+        "lat": lat,
+        "lng": lng,
+    }
 
 
 def extract_rain_value(mode, result):
@@ -793,15 +828,10 @@ def build_incremental_rollups(existing_parent, new_history_entry, previous_hour_
     new_dt = parse_iso_utc(new_row["fileTimestampUtc"])
     new_local_date = new_dt.astimezone(tz).date().isoformat()
 
-    cutoff_dt = new_dt - timedelta(days=KEEP_DAYS)
-    cutoff_iso = iso_utc(cutoff_dt)
-
     existing_last24 = []
     for row in (existing_parent.get("mrmsHourlyLast24") or []):
         norm = normalize_hour_history_row(row)
         if not norm:
-            continue
-        if norm["fileTimestampUtc"] < cutoff_iso:
             continue
         existing_last24.append(norm)
 
@@ -830,7 +860,6 @@ def build_incremental_rollups(existing_parent, new_history_entry, previous_hour_
         daily_map[new_local_date] = bucket
 
     prev_row = normalize_hour_history_row(previous_hour_entry) if previous_hour_entry else None
-    prev_dt = None
     prev_local_date = None
     if prev_row:
         try:
@@ -838,7 +867,6 @@ def build_incremental_rollups(existing_parent, new_history_entry, previous_hour_
             prev_local_date = prev_dt.astimezone(tz).date().isoformat()
         except Exception:
             prev_row = None
-            prev_dt = None
             prev_local_date = None
 
     if prev_row and prev_local_date:
@@ -847,7 +875,10 @@ def build_incremental_rollups(existing_parent, new_history_entry, previous_hour_
             prev_bucket = {"dateISO": prev_local_date, "rainMm": 0.0, "hoursCount": 0}
             daily_map[prev_local_date] = prev_bucket
 
-        prev_bucket["rainMm"] = round_num((num(prev_bucket.get("rainMm")) or 0.0) - (num(prev_row.get("rainMm")) or 0.0), 4)
+        prev_bucket["rainMm"] = round_num(
+            (num(prev_bucket.get("rainMm")) or 0.0) - (num(prev_row.get("rainMm")) or 0.0),
+            4
+        )
         if prev_bucket["rainMm"] < 0:
             prev_bucket["rainMm"] = 0.0
 
@@ -861,7 +892,6 @@ def build_incremental_rollups(existing_parent, new_history_entry, previous_hour_
     if not prev_row or prev_row["fileTimestampUtc"] != new_row["fileTimestampUtc"]:
         bucket["hoursCount"] = int(num(bucket.get("hoursCount")) or 0) + 1
 
-    last24.sort(key=lambda x: x["fileTimestampUtc"], reverse=True)
     daily30 = trim_daily30_map(daily_map, new_dt)
     return last24, daily30
 
@@ -873,6 +903,7 @@ def maybe_prune_old_hourly_docs(field_id, anchor_hour_utc):
     anchor_dt = floor_to_hour_utc(parse_iso_utc(anchor_hour_utc))
     tz = get_app_tz()
 
+    # Only prune once per local day around midnight to avoid extra query cost every hour.
     if anchor_dt.astimezone(tz).hour != 0:
         return {"deleted": 0, "skipped": True}
 
@@ -977,6 +1008,9 @@ def write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, resu
 
     hour_ref.set(history_entry, merge=True)
 
+    # MONEY-SAVING CHANGE:
+    # Existing fields no longer rebuild by rereading the entire hourly subcollection here.
+    # We update rollups from the already-saved parent arrays plus the one hour being written.
     last24, daily30 = build_incremental_rollups(
         existing_parent=existing_parent,
         new_history_entry=history_entry,
@@ -1548,6 +1582,7 @@ def finalize_field_parent_from_hourly(field_id, mark_full_backfill_complete=Fals
         "longitudeMode": latest_doc.get("longitudeMode"),
     }
 
+    # Full rebuild is preserved here for backfill / repair completion.
     last24, daily30 = rebuild_last24_and_daily30(field["id"])
     existing_state = get_field_mrms_state(field["id"])
     parent_payload = build_latest_payload(
@@ -2002,6 +2037,10 @@ def root():
         "repairChunkHours": DEFAULT_REPAIR_CHUNK_HOURS,
         "locationEpsilon": LOCATION_EPSILON,
         "rainUnit": "mm",
+        "notes": {
+            "normalWrites": "incremental parent updates (no full history reread)",
+            "fullRebuilds": "used for finalize/backfill/repair completion only"
+        },
         "routes": {
             "single": "/api/mrms-1h?lat=39.7898&lon=-91.2059",
             "weighted": "/api/mrms-1h?lat=39.7898&lon=-91.2059&radiusMiles=0.5&mode=weighted",

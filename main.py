@@ -552,47 +552,115 @@ def build_weighted_result(da, lat, lon, radius_miles):
     }
 
 
+def extract_field_lat_lng(data):
+    d = data or {}
+    loc = d.get("location") or {}
+
+    lat = num(
+        loc.get("lat")
+        if isinstance(loc, dict) else None
+    )
+    lng = num(
+        loc.get("lng")
+        if isinstance(loc, dict) else None
+    )
+
+    if lat is None:
+        lat = num(d.get("lat"))
+    if lng is None:
+        lng = num(d.get("lng"))
+    if lng is None:
+        lng = num(d.get("lon"))
+    if lng is None:
+        lng = num(d.get("long"))
+
+    return lat, lng
+
+
+def field_doc_is_active(data):
+    d = data or {}
+    status = str(d.get("status") or "").strip().lower()
+
+    archived = d.get("archived")
+    is_archived = archived is True
+
+    active_flag = d.get("active")
+    is_active_flag = active_flag is True
+
+    enabled_flag = d.get("enabled")
+    is_enabled_flag = enabled_flag is True
+
+    if status in {"archived", "inactive", "deleted", "disabled"}:
+        return False
+    if is_archived:
+        return False
+    if status == "active":
+        return True
+    if is_active_flag or is_enabled_flag:
+        return True
+
+    # If status is blank, treat the doc as active unless it is explicitly archived/inactive.
+    if status == "":
+        return True
+
+    return False
+
+
+def build_field_stub(doc_id, data):
+    d = data or {}
+    lat, lng = extract_field_lat_lng(d)
+    if lat is None or lng is None:
+        return None
+
+    return {
+        "id": doc_id,
+        "name": str(d.get("name") or d.get("fieldName") or ""),
+        "farmId": d.get("farmId"),
+        "farmName": d.get("farmName"),
+        "lat": lat,
+        "lng": lng,
+        "status": str(d.get("status") or "").strip().lower(),
+        "active": d.get("active"),
+        "archived": d.get("archived"),
+    }
+
+
 def load_active_fields_for_batch():
     db = get_db()
     raw = []
+    seen = set()
 
     try:
         snap = db.collection(FIELDS_COLLECTION).where("status", "==", "active").stream()
         for doc in snap:
+            if doc.id in seen:
+                continue
+            seen.add(doc.id)
             raw.append({"id": doc.id, "data": doc.to_dict() or {}})
     except Exception as e:
         print(f"[Batch] fields query(status==active) failed: {e}", flush=True)
 
-    if not raw:
-        try:
-            snap2 = db.collection(FIELDS_COLLECTION).stream()
-            for doc in snap2:
-                raw.append({"id": doc.id, "data": doc.to_dict() or {}})
-        except Exception as e:
-            print(f"[Batch] fields query(all) failed: {e}", flush=True)
-            raw = []
+    try:
+        snap2 = db.collection(FIELDS_COLLECTION).stream()
+        for doc in snap2:
+            if doc.id in seen:
+                continue
+            seen.add(doc.id)
+            raw.append({"id": doc.id, "data": doc.to_dict() or {}})
+    except Exception as e:
+        print(f"[Batch] fields query(all) failed: {e}", flush=True)
 
     out = []
     for r in raw:
         d = r["data"] or {}
-        status = str(d.get("status", "")).strip().lower()
-        if status != "active":
+        if not field_doc_is_active(d):
             continue
 
-        loc = d.get("location") or {}
-        lat = num(loc.get("lat"))
-        lng = num(loc.get("lng"))
-        if lat is None or lng is None:
+        field = build_field_stub(r["id"], d)
+        if not field:
             continue
 
-        out.append({
-            "id": r["id"],
-            "name": str(d.get("name") or ""),
-            "farmId": d.get("farmId"),
-            "farmName": d.get("farmName"),
-            "lat": lat,
-            "lng": lng,
-        })
+        out.append(field)
 
     return out
 
@@ -604,20 +672,11 @@ def get_field_by_id(field_id):
         return None
 
     d = doc.to_dict() or {}
-    loc = d.get("location") or {}
-    lat = num(loc.get("lat"))
-    lng = num(loc.get("lng"))
-    if lat is None or lng is None:
+    field = build_field_stub(doc.id, d)
+    if not field:
         raise RuntimeError("Field exists but location.lat/lng is missing or invalid")
 
-    return {
-        "id": doc.id,
-        "name": str(d.get("name") or ""),
-        "farmId": d.get("farmId"),
-        "farmName": d.get("farmName"),
-        "lat": lat,
-        "lng": lng,
-    }
+    return field
 
 
 def extract_rain_value(mode, result):
@@ -1363,6 +1422,68 @@ def enqueue_backfill_all(days=30, mode="weighted", radius_miles=DEFAULT_RADIUS_M
     }
 
 
+def enqueue_repair_all(lookback_hours=DEFAULT_REPAIR_LOOKBACK_HOURS, mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
+    fields = load_active_fields_for_batch()
+
+    lookback_hours = int(clamp(lookback_hours, 1, KEEP_HOURS))
+    if mode not in {"single", "weighted"}:
+        raise RuntimeError("mode must be 'single' or 'weighted'")
+    if radius_miles <= 0:
+        raise RuntimeError("radiusMiles must be > 0")
+
+    meta = get_cached_dataset()
+    latest_hour_utc = meta["fileTimestampUtc"]
+
+    queued = 0
+    no_gap = 0
+    already_active = 0
+    failed = 0
+    failures = []
+
+    for field in fields:
+        try:
+            missing = find_missing_recent_hours(
+                field_id=field["id"],
+                latest_hour_utc=latest_hour_utc,
+                lookback_hours=lookback_hours,
+            )
+
+            if not missing:
+                no_gap += 1
+                continue
+
+            out = enqueue_gap_repair(
+                field_id=field["id"],
+                start_hour_utc=missing[0],
+                end_hour_utc=missing[-1],
+                mode=mode,
+                radius_miles=radius_miles,
+            )
+            if out.get("status") == "already_active":
+                already_active += 1
+            else:
+                queued += 1
+        except Exception as e:
+            failed += 1
+            failures.append({
+                "fieldId": field["id"],
+                "fieldName": field.get("name"),
+                "error": str(e),
+            })
+
+    return {
+        "lookbackHours": lookback_hours,
+        "latestHourUtc": latest_hour_utc,
+        "totalActiveFields": len(fields),
+        "queued": queued,
+        "alreadyActive": already_active,
+        "noGap": no_gap,
+        "failed": failed,
+        "queueCollection": MRMS_BACKFILL_QUEUE_COLLECTION,
+        "failures": failures[:50],
+    }
+
+
 def maybe_auto_enqueue_backfill(field, mode, radius_miles):
     if not field_needs_full_backfill(field["id"]):
         return {"fieldId": field["id"], "queued": False, "reason": "full_backfill_complete"}
@@ -1848,6 +1969,77 @@ def process_next_backfill():
     }
 
 
+def process_repair_all(max_fields=None, max_minutes=None):
+    db = get_db()
+
+    if max_fields is None:
+        try:
+            max_fields = int(request.args.get("maxFields") or 0)
+        except Exception:
+            max_fields = 0
+    if max_minutes is None:
+        try:
+            max_minutes = float(request.args.get("maxMinutes") or 0)
+        except Exception:
+            max_minutes = 0
+
+    max_fields = max(0, int(max_fields or 0))
+    max_minutes = max(0.0, float(max_minutes or 0))
+
+    started = datetime.now(timezone.utc)
+    processed = 0
+    failed = 0
+    results = []
+
+    while True:
+        if max_fields and processed >= max_fields:
+            break
+
+        if max_minutes:
+            elapsed_minutes = (datetime.now(timezone.utc) - started).total_seconds() / 60.0
+            if elapsed_minutes >= max_minutes:
+                break
+
+        out = process_next_repair_gap()
+        if not out.get("processed"):
+            break
+
+        processed += 1
+        if out.get("status") == "failed":
+            failed += 1
+
+        results.append({
+            "fieldId": out.get("fieldId"),
+            "fieldName": out.get("fieldName"),
+            "status": out.get("status"),
+            "hoursDoneAfter": out.get("hoursDoneAfter"),
+            "hoursTotal": out.get("hoursTotal"),
+            "finalized": out.get("finalized"),
+        })
+
+    remaining_queued = 0
+    try:
+        remaining = list(
+            db.collection(MRMS_BACKFILL_QUEUE_COLLECTION)
+            .where("status", "==", "queued")
+            .limit(500)
+            .stream()
+        )
+        for doc in remaining:
+            job = doc.to_dict() or {}
+            if str(job.get("jobType") or "").strip().lower() == "repair_gap":
+                remaining_queued += 1
+    except Exception:
+        pass
+
+    return {
+        "processed": processed,
+        "failed": failed,
+        "remainingQueuedRepairJobs": remaining_queued,
+        "results": results[-50:],
+    }
+
+
 def process_next_repair_gap():
     db = get_db()
     queued = list(
@@ -2243,6 +2435,51 @@ def repair_field_route():
             "latestHourUtc": meta["fileTimestampUtc"],
             "missingCount": len(missing),
             "queue": out,
+        })
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.get("/enqueue-repair-all")
+def enqueue_repair_all_route():
+    try:
+        lookback_hours = int(request.args.get("lookbackHours") or DEFAULT_REPAIR_LOOKBACK_HOURS)
+        mode = (request.args.get("mode") or "weighted").strip().lower()
+        radius_miles = num(request.args.get("radiusMiles")) or DEFAULT_RADIUS_MILES
+
+        out = enqueue_repair_all(
+            lookback_hours=lookback_hours,
+            mode=mode,
+            radius_miles=radius_miles,
+        )
+        return jsonify({"ok": True, **out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
+
+
+@app.get("/run-repair-all")
+def run_repair_all_route():
+    try:
+        lookback_hours = int(request.args.get("lookbackHours") or DEFAULT_REPAIR_LOOKBACK_HOURS)
+        mode = (request.args.get("mode") or "weighted").strip().lower()
+        radius_miles = num(request.args.get("radiusMiles")) or DEFAULT_RADIUS_MILES
+        max_fields = int(request.args.get("maxFields") or 0)
+        max_minutes = float(request.args.get("maxMinutes") or 0)
+
+        enq = enqueue_repair_all(
+            lookback_hours=lookback_hours,
+            mode=mode,
+            radius_miles=radius_miles,
+        )
+        proc = process_repair_all(
+            max_fields=max_fields,
+            max_minutes=max_minutes,
+        )
+
+        return jsonify({
+            "ok": True,
+            "enqueue": enq,
+            "process": proc,
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500

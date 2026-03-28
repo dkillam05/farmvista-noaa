@@ -1,7 +1,7 @@
 # =====================================================================
 # main.py  (FULL FILE)
 # FarmVista NOAA MRMS Pass2->Pass1 fallback rainfall service
-# Rev: 2026-03-27b-safe-incremental-fallback-no-io-in-parent
+# Rev: 2026-03-28c-merged-repair-safe-incremental-stale-skip
 #
 # PURPOSE
 # ✅ Pulls MRMS hourly rainfall from NOAA AWS
@@ -17,6 +17,8 @@
 # ✅ FIX: if incremental rollup fails, fall back to full rebuild from saved hourly docs
 # ✅ FIX: parent payload no longer tries to store non-Firestore-safe objects
 # ✅ FIX: full rebuild path is preserved for full backfill / repair completion only
+# ✅ FIX: restore robust longitude/grid sampling logic from prior working version
+# ✅ FIX: normal writes skip duplicate/stale latest hour for each field
 #
 # NOTES
 # - This file keeps the original route/helper structure.
@@ -346,6 +348,63 @@ def load_dataset_for_key(key):
             pass
 
 
+def get_data_var(ds):
+    preferred = ["unknown", "tp", "precipitation", "precip", "param18.0.0", "paramId_0"]
+
+    for name in preferred:
+        if name in ds.data_vars:
+            return ds[name], name
+
+    data_vars = list(ds.data_vars.keys())
+    if not data_vars:
+        raise RuntimeError("No data variables found in MRMS GRIB.")
+    return ds[data_vars[0]], data_vars[0]
+
+
+def normalize_data_array(da):
+    rename_map = {}
+
+    if "latitude" not in da.coords and "lat" in da.coords:
+        rename_map["lat"] = "latitude"
+    if "longitude" not in da.coords and "lon" in da.coords:
+        rename_map["lon"] = "longitude"
+
+    if rename_map:
+        da = da.rename(rename_map)
+
+    if "latitude" not in da.coords or "longitude" not in da.coords:
+        raise RuntimeError(
+            f"Dataset missing usable latitude/longitude coordinates. Found coords: {list(da.coords)}"
+        )
+
+    for dim in list(da.dims):
+        if dim not in ("latitude", "longitude") and da.sizes.get(dim, 0) == 1:
+            da = da.isel({dim: 0})
+
+    return da
+
+
+def detect_lon_convention(da):
+    lon_vals = da["longitude"].values
+    lon_min = float(np.nanmin(lon_vals))
+    lon_max = float(np.nanmax(lon_vals))
+
+    if lon_min >= 0.0 and lon_max > 180.0:
+        return "0_360"
+
+    return "signed"
+
+
+def to_dataset_lon(lon, lon_mode):
+    if lon_mode == "0_360":
+        return lon if lon >= 0 else lon + 360.0
+    return lon
+
+
+def to_signed_lon(lon):
+    return lon - 360.0 if lon > 180.0 else lon
+
+
 def prepare_cache_for_key(key, product):
     ts = parse_timestamp_from_key(key)
     with CACHE_LOCK:
@@ -354,19 +413,8 @@ def prepare_cache_for_key(key, product):
             return
 
     ds = load_dataset_for_key(key)
-
-    variable_name = None
-    for candidate in ["unknown", "tp", "precip", "precipitation", "param18.0.0"]:
-        if candidate in ds.data_vars:
-            variable_name = candidate
-            break
-    if variable_name is None:
-        data_vars = list(ds.data_vars.keys())
-        if not data_vars:
-            raise RuntimeError("No data variables found in MRMS GRIB.")
-        variable_name = data_vars[0]
-
-    da = ds[variable_name]
+    da_raw, variable_name = get_data_var(ds)
+    da = normalize_data_array(da_raw)
 
     with CACHE_LOCK:
         old_ds = CACHE.get("io")
@@ -407,19 +455,8 @@ def get_cached_dataset():
 
 def get_dataset_for_key_uncached(product, key):
     ds = load_dataset_for_key(key)
-
-    variable_name = None
-    for candidate in ["unknown", "tp", "precip", "precipitation", "param18.0.0"]:
-        if candidate in ds.data_vars:
-            variable_name = candidate
-            break
-    if variable_name is None:
-        data_vars = list(ds.data_vars.keys())
-        if not data_vars:
-            raise RuntimeError("No data variables found in MRMS GRIB.")
-        variable_name = data_vars[0]
-
-    da = ds[variable_name]
+    da_raw, variable_name = get_data_var(ds)
+    da = normalize_data_array(da_raw)
     ts = parse_timestamp_from_key(key)
 
     return {
@@ -433,29 +470,36 @@ def get_dataset_for_key_uncached(product, key):
     }
 
 
-def get_cache_da():
-    with CACHE_LOCK:
-        da = CACHE.get("dataArray")
-        if da is None:
-            raise RuntimeError("MRMS cache is empty.")
-        return da
+def sample_nearest_with_grid(da, lat, lon):
+    lon_mode = detect_lon_convention(da)
+    query_lon = to_dataset_lon(lon, lon_mode)
 
+    sampled = da.sel(latitude=lat, longitude=query_lon, method="nearest")
 
-def latlon_name_candidates(da):
-    dims = list(da.dims)
-    coords = list(da.coords)
-    lat_names = [n for n in ["latitude", "lat", "y"] if n in dims or n in coords]
-    lon_names = [n for n in ["longitude", "lon", "x"] if n in dims or n in coords]
-    if not lat_names or not lon_names:
-        raise RuntimeError(f"Could not identify lat/lon axes. dims={dims}, coords={coords}")
-    return lat_names[0], lon_names[0]
+    value = sampled.values
+    if isinstance(value, np.ndarray):
+        value = np.asarray(value).squeeze()
+        if np.size(value) != 1:
+            raise RuntimeError("Unexpected non-scalar sampled value from MRMS dataset.")
+        value = float(value)
+    else:
+        value = float(value)
 
+    grid_lat = float(sampled["latitude"].values)
+    raw_grid_lon = float(sampled["longitude"].values)
+    signed_grid_lon = to_signed_lon(raw_grid_lon)
 
-def sample_one_point(da, lat, lon):
-    lat_name, lon_name = latlon_name_candidates(da)
-    selected = da.sel({lat_name: lat, lon_name: lon}, method="nearest")
-    value = float(selected.values)
-    return value
+    if not math.isfinite(value) or value < 0:
+        value = 0.0
+
+    return {
+        "mm": value,
+        "nearestGridLatitude": grid_lat,
+        "nearestGridLongitude": signed_grid_lon,
+        "nearestGridLongitudeRaw": raw_grid_lon,
+        "queryLongitudeUsed": query_lon,
+        "longitudeMode": lon_mode,
+    }
 
 
 def mm_from_dataset_value(value):
@@ -477,10 +521,11 @@ def compute_weighted_mm(da, lat, lon, radius_miles):
             east_miles=sp["dxMiles"] * radius_miles,
             north_miles=sp["dyMiles"] * radius_miles,
         )
-        raw_mm = sample_one_point(da, p_lat, p_lon)
-        rain_mm = mm_from_dataset_value(raw_mm)
+        sampled = sample_nearest_with_grid(da, p_lat, p_lon)
+        rain_mm = mm_from_dataset_value(sampled["mm"])
         if rain_mm is None:
             rain_mm = 0.0
+
         weighted_sum += rain_mm * sp["weight"]
         total_weight += sp["weight"]
         samples_out.append({
@@ -489,6 +534,12 @@ def compute_weighted_mm(da, lat, lon, radius_miles):
             "lon": round_num(p_lon, 6),
             "weight": sp["weight"],
             "mm": round_num(rain_mm, 4),
+            "nearestGridLatitude": round_num(sampled["nearestGridLatitude"], 6),
+            "nearestGridLongitude": round_num(sampled["nearestGridLongitude"], 6),
+            "nearestGridLongitudeRaw": round_num(sampled["nearestGridLongitudeRaw"], 6),
+            "queryLongitudeUsed": round_num(sampled["queryLongitudeUsed"], 6),
+            "longitudeMode": sampled["longitudeMode"],
+            "ok": True,
         })
 
     final_mm = weighted_sum / total_weight if total_weight > 0 else 0.0
@@ -524,7 +575,8 @@ def validate_point(lat, lon):
 
 
 def build_single_result(da, lat, lon):
-    hourly_rain_mm = mm_from_dataset_value(sample_one_point(da, lat, lon))
+    sampled = sample_nearest_with_grid(da, lat, lon)
+    hourly_rain_mm = mm_from_dataset_value(sampled["mm"])
     if hourly_rain_mm is None:
         hourly_rain_mm = 0.0
 
@@ -532,11 +584,11 @@ def build_single_result(da, lat, lon):
         "lat": round_num(lat, 6),
         "lon": round_num(lon, 6),
         "hourlyRainMm": round_num(hourly_rain_mm, 4),
-        "nearestGridLatitude": round_num(lat, 6),
-        "nearestGridLongitude": round_num(lon, 6),
-        "nearestGridLongitudeRaw": round_num(lon, 6),
-        "queryLongitudeUsed": round_num(lon, 6),
-        "longitudeMode": "native",
+        "nearestGridLatitude": round_num(sampled["nearestGridLatitude"], 6),
+        "nearestGridLongitude": round_num(sampled["nearestGridLongitude"], 6),
+        "nearestGridLongitudeRaw": round_num(sampled["nearestGridLongitudeRaw"], 6),
+        "queryLongitudeUsed": round_num(sampled["queryLongitudeUsed"], 6),
+        "longitudeMode": sampled["longitudeMode"],
     }
 
 
@@ -558,14 +610,8 @@ def extract_field_lat_lng(data):
     d = data or {}
     loc = d.get("location") or {}
 
-    lat = num(
-        loc.get("lat")
-        if isinstance(loc, dict) else None
-    )
-    lng = num(
-        loc.get("lng")
-        if isinstance(loc, dict) else None
-    )
+    lat = num(loc.get("lat") if isinstance(loc, dict) else None)
+    lng = num(loc.get("lng") if isinstance(loc, dict) else None)
 
     if lat is None:
         lat = num(d.get("lat"))
@@ -600,8 +646,6 @@ def field_doc_is_active(data):
         return True
     if is_active_flag or is_enabled_flag:
         return True
-
-    # If status is blank, treat the doc as active unless it is explicitly archived/inactive.
     if status == "":
         return True
 
@@ -963,7 +1007,6 @@ def maybe_prune_old_hourly_docs(field_id, anchor_hour_utc):
     anchor_dt = floor_to_hour_utc(parse_iso_utc(anchor_hour_utc))
     tz = get_app_tz()
 
-    # Only prune once per local day around midnight to avoid extra query cost every hour.
     if anchor_dt.astimezone(tz).hour != 0:
         return {"deleted": 0, "skipped": True}
 
@@ -1055,6 +1098,29 @@ def rebuild_last24_and_daily30(field_id):
     return last24, daily30
 
 
+def should_skip_normal_write(existing_parent, incoming_file_timestamp_utc):
+    try:
+        if not incoming_file_timestamp_utc:
+            return False
+
+        incoming_dt = parse_iso_utc(incoming_file_timestamp_utc)
+
+        history_meta = existing_parent.get("mrmsHistoryMeta") or {}
+        current_ts = str(history_meta.get("latestFileTimestampUtc") or "").strip()
+
+        if not current_ts:
+            latest = existing_parent.get("mrmsHourlyLatest") or {}
+            current_ts = str(latest.get("fileTimestampUtc") or "").strip()
+
+        if not current_ts:
+            return False
+
+        current_dt = parse_iso_utc(current_ts)
+        return incoming_dt <= current_dt
+    except Exception:
+        return False
+
+
 def write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, result):
     history_entry = build_hour_history_entry(meta, mode, radius_miles, result)
 
@@ -1066,11 +1132,8 @@ def write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, resu
     if previous_hour_snap.exists:
         previous_hour_entry = previous_hour_snap.to_dict() or {}
 
-    # Always save the hourly doc first.
     hour_ref.set(history_entry, merge=True)
 
-    # First try incremental rollups. If that fails for any reason,
-    # fall back to rebuilding from the saved hourly subcollection so writes keep flowing.
     rollup_mode = "incremental"
     try:
         last24, daily30 = build_incremental_rollups(
@@ -1584,6 +1647,7 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
     da = meta["dataArray"]
 
     ok = 0
+    skipped_stale = 0
     fail = 0
     failures = []
     auto_enqueued_backfills = 0
@@ -1614,9 +1678,30 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
                 auto_enqueue_backfill_failures += 1
                 print(f"[AutoEnqueueFull] failed for {field['id']}: {e}", flush=True)
 
+            parent_ref = get_db().collection(MRMS_PARENT_COLLECTION).document(field["id"])
+            existing_parent_snap = parent_ref.get()
+            existing_parent = existing_parent_snap.to_dict() or {}
+
+            if not location_changed_this_run and should_skip_normal_write(existing_parent, meta["fileTimestampUtc"]):
+                skipped_stale += 1
+
+                try:
+                    auto_rep = maybe_auto_enqueue_gap_repair(
+                        field=field,
+                        mode=mode,
+                        radius_miles=radius_miles,
+                        latest_hour_utc=meta["fileTimestampUtc"],
+                    )
+                    if auto_rep.get("queued"):
+                        auto_enqueued_repairs += 1
+                except Exception as e:
+                    auto_enqueue_repair_failures += 1
+                    print(f"[AutoEnqueueRepair] failed for {field['id']}: {e}", flush=True)
+
+                continue
+
             result = build_single_result(da, field["lat"], field["lng"]) if mode == "single" else build_weighted_result(da, field["lat"], field["lng"], radius_miles)
 
-            parent_ref = get_db().collection(MRMS_PARENT_COLLECTION).document(field["id"])
             hour_id = hour_doc_id_from_iso(meta["fileTimestampUtc"])
             hour_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION).document(hour_id)
             write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, result)
@@ -1647,6 +1732,7 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
     return {
         "total": total,
         "ok": ok,
+        "skippedStaleOrDuplicateLatest": skipped_stale,
         "fail": fail,
         "collection": MRMS_PARENT_COLLECTION,
         "selectedProduct": meta["selectedProduct"],
@@ -1712,7 +1798,6 @@ def finalize_field_parent_from_hourly(field_id, mark_full_backfill_complete=Fals
         "longitudeMode": latest_doc.get("longitudeMode"),
     }
 
-    # Full rebuild is preserved here for backfill / repair completion.
     last24, daily30 = rebuild_last24_and_daily30(field["id"])
     existing_state = get_field_mrms_state(field["id"])
     parent_payload = build_latest_payload(
@@ -2203,7 +2288,7 @@ def process_next_repair_gap():
 
     finalized = None
     if finished:
-        finalized = finalize_field_parent_from_hourly(field_id, mark_full_backfill_complete=False)
+        finalized = finalize_field_parent_from_hourly(field_id, mark_fullBackfill_complete=False)
 
     return {
         "processed": True,

@@ -333,14 +333,14 @@ def load_dataset_for_key(key):
     fs = get_fs()
     local_path = gunzip_to_tempfile(fs, key)
     try:
-        ds = xr.open_dataset(local_path, engine="cfgrib")
-        return ds
-    except Exception:
         try:
-            ds = xr.open_dataset(local_path, engine="pynio")
+            ds = xr.open_dataset(local_path, engine="cfgrib")
+            ds.load()
             return ds
         except Exception:
-            raise
+            ds = xr.open_dataset(local_path, engine="pynio")
+            ds.load()
+            return ds
     finally:
         try:
             os.remove(local_path)

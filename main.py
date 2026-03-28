@@ -2288,7 +2288,7 @@ def process_next_repair_gap():
 
     finalized = None
     if finished:
-        finalized = finalize_field_parent_from_hourly(field_id, mark_fullBackfill_complete=False)
+        finalized = finalize_field_parent_from_hourly(field_id, mark_full_backfill_complete=False)
 
     return {
         "processed": True,

@@ -1,7 +1,7 @@
 # =====================================================================
 # main.py  (FULL FILE)
 # FarmVista NOAA MRMS Pass2->Pass1 fallback rainfall service
-# Rev: 2026-03-27a-incremental-rollups-keep-original-routes
+# Rev: 2026-03-27b-safe-incremental-fallback-no-io-in-parent
 #
 # PURPOSE
 # ✅ Pulls MRMS hourly rainfall from NOAA AWS
@@ -14,6 +14,8 @@
 # ✅ Treats moved fields like new fields automatically
 # ✅ FIX: existing fields no longer reread all historical hourly docs on each normal write
 # ✅ FIX: parent last24 + daily30 rollups now update incrementally on normal writes
+# ✅ FIX: if incremental rollup fails, fall back to full rebuild from saved hourly docs
+# ✅ FIX: parent payload no longer tries to store non-Firestore-safe objects
 # ✅ FIX: full rebuild path is preserved for full backfill / repair completion only
 #
 # NOTES
@@ -790,7 +792,6 @@ def build_latest_payload(field, meta, mode, radius_miles, result, last24, daily3
         "mode": mode,
         "radiusMiles": radius_miles if mode == "weighted" else None,
         "cacheHit": meta["cacheHit"],
-        "io": meta["io"],
         "checkedProducts": meta.get("checkedProducts"),
         "updatedAt": firestore.SERVER_TIMESTAMP,
         "rainMm": extract_rain_value(mode, result),
@@ -1065,16 +1066,22 @@ def write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, resu
     if previous_hour_snap.exists:
         previous_hour_entry = previous_hour_snap.to_dict() or {}
 
+    # Always save the hourly doc first.
     hour_ref.set(history_entry, merge=True)
 
-    # MONEY-SAVING CHANGE:
-    # Existing fields no longer rebuild by rereading the entire hourly subcollection here.
-    # We update rollups from the already-saved parent arrays plus the one hour being written.
-    last24, daily30 = build_incremental_rollups(
-        existing_parent=existing_parent,
-        new_history_entry=history_entry,
-        previous_hour_entry=previous_hour_entry,
-    )
+    # First try incremental rollups. If that fails for any reason,
+    # fall back to rebuilding from the saved hourly subcollection so writes keep flowing.
+    rollup_mode = "incremental"
+    try:
+        last24, daily30 = build_incremental_rollups(
+            existing_parent=existing_parent,
+            new_history_entry=history_entry,
+            previous_hour_entry=previous_hour_entry,
+        )
+    except Exception as e:
+        print(f"[MRMS Incremental Rollup Fallback] field={field['id']} error={e}", flush=True)
+        last24, daily30 = rebuild_last24_and_daily30(field["id"])
+        rollup_mode = "full_rebuild_fallback"
 
     existing_state = {
         "historyMeta": existing_parent.get("mrmsHistoryMeta") or {},
@@ -1090,6 +1097,8 @@ def write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, resu
         daily30=daily30,
         existing_state=existing_state,
     )
+    parent_payload["mrmsHistoryMeta"]["lastRollupMode"] = rollup_mode
+
     parent_ref.set(parent_payload, merge=True)
 
     try:
@@ -2493,6 +2502,7 @@ def process_next_repair_route():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
 
+
 @app.get("/process-repair-batch")
 def process_repair_batch_route():
     try:
@@ -2578,6 +2588,7 @@ def field_state_route():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
 
+
 @app.get("/queue-simple")
 def queue_simple():
     try:
@@ -2615,6 +2626,8 @@ def queue_simple():
             "ok": False,
             "error": str(e)
         }), 500
+
+
 # ---------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------

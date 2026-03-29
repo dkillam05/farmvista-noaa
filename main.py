@@ -1104,7 +1104,6 @@ def rebuild_last24_and_daily30(field_id):
 
     return last24, daily30
 
-
 def should_skip_normal_write(existing_parent, incoming_file_timestamp_utc):
     try:
         if not incoming_file_timestamp_utc:
@@ -1123,9 +1122,23 @@ def should_skip_normal_write(existing_parent, incoming_file_timestamp_utc):
             return False
 
         current_dt = parse_iso_utc(current_ts)
-        return incoming_dt <= current_dt
-    except Exception:
+
+        # Only skip when incoming data is truly OLDER than what we already have.
+        # If NOAA repeats the same hour/timestamp, allow overwrite/refresh so hourly
+        # does not silently stop updating.
+        if incoming_dt < current_dt:
+            return True
+
         return False
+
+    except Exception as e:
+        print(
+            f"[MRMS Skip Check Error] incoming={incoming_file_timestamp_utc} "
+            f"error={e}",
+            flush=True
+        )
+        return False
+
 
 
 def write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, result):

@@ -1141,17 +1141,33 @@ def write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, resu
 
     hour_ref.set(history_entry, merge=True)
 
-    rollup_mode = "incremental"
-    try:
-        last24, daily30 = build_incremental_rollups(
-            existing_parent=existing_parent,
-            new_history_entry=history_entry,
-            previous_hour_entry=previous_hour_entry,
-        )
-    except Exception as e:
-        print(f"[MRMS Incremental Rollup Fallback] field={field['id']} error={e}", flush=True)
+    history_meta = existing_parent.get("mrmsHistoryMeta") or {}
+    existing_daily30 = existing_parent.get("mrmsDailySeries30d") or []
+
+    # IMPORTANT:
+    # If this field is not fully backfilled yet, or the parent daily rollup is still thin/empty,
+    # do NOT trust incremental rollups. Rebuild from hourly docs so daily totals stay correct.
+    needs_rebuild = (
+        not bool(history_meta.get("fullBackfillComplete", False))
+        or not isinstance(existing_daily30, list)
+        or len(existing_daily30) < 5
+    )
+
+    if needs_rebuild:
         last24, daily30 = rebuild_last24_and_daily30(field["id"])
-        rollup_mode = "full_rebuild_fallback"
+        rollup_mode = "full_rebuild_pre_backfill"
+    else:
+        rollup_mode = "incremental"
+        try:
+            last24, daily30 = build_incremental_rollups(
+                existing_parent=existing_parent,
+                new_history_entry=history_entry,
+                previous_hour_entry=previous_hour_entry,
+            )
+        except Exception as e:
+            print(f"[MRMS Incremental Rollup Fallback] field={field['id']} error={e}", flush=True)
+            last24, daily30 = rebuild_last24_and_daily30(field["id"])
+            rollup_mode = "full_rebuild_fallback"
 
     existing_state = {
         "historyMeta": existing_parent.get("mrmsHistoryMeta") or {},

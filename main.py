@@ -176,7 +176,7 @@ def get_app_tz():
         return timezone.utc
         
 def in_hourly_pause_window():
-    now = datetime.now(ZoneInfo(APP_TIMEZONE))  # uses your Chicago time
+    now = datetime.now(get_app_tz())
     minute = now.minute
 
     # Pause repair from :18 to :24 every hour
@@ -2608,6 +2608,14 @@ def process_repair_batch_route():
 
         max_fields = int(request.args.get("maxFields") or 10)
         max_minutes = float(request.args.get("maxMinutes") or 2)
+
+        out = process_repair_all(
+            max_fields=max_fields,
+            max_minutes=max_minutes,
+        )
+        return jsonify({"ok": True, **out})
+    except Exception as e:
+        return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
 
 
 @app.get("/queue-status")

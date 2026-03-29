@@ -1753,13 +1753,16 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
             existing_parent_snap = parent_ref.get()
             existing_parent = existing_parent_snap.to_dict() or {}
 
-            if not location_changed_this_run and should_skip_normal_write(existing_parent, meta["fileTimestampUtc"]):
-    print(
-        f"[MRMS Stale Skip] fieldId={field['id']} fieldName={field.get('name')} "
-        f"incoming={meta['fileTimestampUtc']}",
-        flush=True
-    )
-    skipped_stale += 1
+            if (
+                not location_changed_this_run
+                and should_skip_normal_write(existing_parent, meta["fileTimestampUtc"])
+            ):
+                print(
+                    f"[MRMS Stale Skip] fieldId={field['id']} fieldName={field.get('name')} "
+                    f"incoming={meta['fileTimestampUtc']}",
+                    flush=True
+                )
+                skipped_stale += 1
 
                 try:
                     auto_rep = maybe_auto_enqueue_gap_repair(
@@ -1776,7 +1779,11 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
 
                 continue
 
-            result = build_single_result(da, field["lat"], field["lng"]) if mode == "single" else build_weighted_result(da, field["lat"], field["lng"], radius_miles)
+            result = (
+                build_single_result(da, field["lat"], field["lng"])
+                if mode == "single"
+                else build_weighted_result(da, field["lat"], field["lng"], radius_miles)
+            )
 
             hour_id = hour_doc_id_from_iso(meta["fileTimestampUtc"])
             hour_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION).document(hour_id)

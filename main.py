@@ -1188,6 +1188,13 @@ def queue_job_exists_active(doc_id):
 
 def field_needs_full_backfill(field_id):
     state = get_field_mrms_state(field_id)
+
+    if not state.get("docExists"):
+        return True
+
+    if not state.get("hasAnyHistory"):
+        return True
+
     return not bool(state.get("fullBackfillComplete", False))
 
 
@@ -1392,6 +1399,14 @@ def enqueue_gap_repair(field_id, start_hour_utc, end_hour_utc, mode="weighted", 
     if not field:
         raise RuntimeError("Field not found")
 
+    if field_needs_full_backfill(field_id):
+        return enqueue_backfill(
+            field_id=field_id,
+            days=KEEP_DAYS,
+            mode=mode,
+            radius_miles=radius_miles,
+        )
+
     if mode not in {"single", "weighted"}:
         raise RuntimeError("mode must be 'single' or 'weighted'")
     if radius_miles <= 0:
@@ -1517,10 +1532,22 @@ def enqueue_repair_all(lookback_hours=DEFAULT_REPAIR_LOOKBACK_HOURS, mode="weigh
     no_gap = 0
     already_active = 0
     failed = 0
+    full_backfill_queued = 0
     failures = []
 
     for field in fields:
         try:
+            if field_needs_full_backfill(field["id"]):
+                out = enqueue_backfill(
+                    field_id=field["id"],
+                    days=KEEP_DAYS,
+                    mode=mode,
+                    radius_miles=radius_miles,
+                )
+                if out.get("status") in {"queued", "already_active"}:
+                    full_backfill_queued += 1
+                continue
+
             missing = find_missing_recent_hours(
                 field_id=field["id"],
                 latest_hour_utc=latest_hour_utc,
@@ -1555,6 +1582,7 @@ def enqueue_repair_all(lookback_hours=DEFAULT_REPAIR_LOOKBACK_HOURS, mode="weigh
         "latestHourUtc": latest_hour_utc,
         "totalActiveFields": len(fields),
         "queued": queued,
+        "fullBackfillQueued": full_backfill_queued,
         "alreadyActive": already_active,
         "noGap": no_gap,
         "failed": failed,
@@ -1611,8 +1639,15 @@ def find_missing_recent_hours(field_id, latest_hour_utc, lookback_hours):
 
 
 def maybe_auto_enqueue_gap_repair(field, mode, radius_miles, latest_hour_utc):
-    if field_needs_full_backfill(field["id"]):
-        return {"fieldId": field["id"], "queued": False, "reason": "full_backfill_not_complete"}
+    state = get_field_mrms_state(field["id"])
+
+    # 🚫 HARD STOP: never repair until full backfill is complete
+    if not state.get("fullBackfillComplete"):
+        return {
+            "fieldId": field["id"],
+            "queued": False,
+            "reason": "waiting_on_full_backfill"
+        }
 
     missing = find_missing_recent_hours(
         field_id=field["id"],
@@ -2502,6 +2537,23 @@ def repair_field_route():
         if not field:
             return jsonify({"ok": False, "error": "Field not found"}), 404
 
+        if field_needs_full_backfill(field_id):
+            out = enqueue_backfill(
+                field_id=field_id,
+                days=KEEP_DAYS,
+                mode=mode,
+                radius_miles=radius_miles,
+            )
+            return jsonify({
+                "ok": True,
+                "fieldId": field_id,
+                "fieldName": field.get("name"),
+                "queued": True,
+                "jobType": "full_backfill",
+                "reason": "field_needs_full_backfill",
+                "queue": out,
+            })
+
         meta = get_cached_dataset()
         missing = find_missing_recent_hours(
             field_id=field_id,
@@ -2532,6 +2584,7 @@ def repair_field_route():
             "fieldId": field_id,
             "fieldName": field.get("name"),
             "queued": True,
+            "jobType": "repair_gap",
             "lookbackHours": lookback_hours,
             "latestHourUtc": meta["fileTimestampUtc"],
             "missingCount": len(missing),
@@ -2539,7 +2592,6 @@ def repair_field_route():
         })
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
-
 
 @app.get("/enqueue-repair-all")
 def enqueue_repair_all_route():

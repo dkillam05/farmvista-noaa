@@ -174,6 +174,13 @@ def get_app_tz():
         return ZoneInfo(APP_TIMEZONE)
     except Exception:
         return timezone.utc
+        
+def in_hourly_pause_window():
+    now = datetime.now(ZoneInfo(APP_TIMEZONE))  # uses your Chicago time
+    minute = now.minute
+
+    # Pause repair from :18 to :24 every hour
+    return 18 <= minute <= 24
 
 
 def list_candidate_dates(now_utc, days_back=2):
@@ -2591,16 +2598,16 @@ def process_next_repair_route():
 @app.get("/process-repair-batch")
 def process_repair_batch_route():
     try:
+        # ⛔ PAUSE WINDOW (prevents collision with hourly)
+        if in_hourly_pause_window():
+            return jsonify({
+                "ok": True,
+                "skipped": True,
+                "reason": "paused_for_hourly_window"
+            })
+
         max_fields = int(request.args.get("maxFields") or 10)
         max_minutes = float(request.args.get("maxMinutes") or 2)
-
-        out = process_repair_all(
-            max_fields=max_fields,
-            max_minutes=max_minutes,
-        )
-        return jsonify({"ok": True, **out})
-    except Exception as e:
-        return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
 
 
 @app.get("/queue-status")

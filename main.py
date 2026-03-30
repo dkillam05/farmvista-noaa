@@ -1,7 +1,7 @@
 # =====================================================================
 # main.py  (FULL FILE)
 # FarmVista NOAA MRMS Pass2->Pass1 fallback rainfall service
-# Rev: 2026-03-28c-merged-repair-safe-incremental-stale-skip
+# Rev: 2026-03-30a-hourly-sequential-next-hour-fix
 #
 # PURPOSE
 # ✅ Pulls MRMS hourly rainfall from NOAA AWS
@@ -19,6 +19,10 @@
 # ✅ FIX: full rebuild path is preserved for full backfill / repair completion only
 # ✅ FIX: restore robust longitude/grid sampling logic from prior working version
 # ✅ FIX: normal writes skip duplicate/stale latest hour for each field
+# ✅ NEW: hourly run now writes the NEXT needed hour per field instead of blindly
+#         using the same global "latest available" hour for every field
+# ✅ NEW: prevents stale-skip spam caused by fields already being ahead of the
+#         current NOAA "latest available" file selected at run time
 #
 # NOTES
 # - This file keeps the original route/helper structure.
@@ -174,7 +178,8 @@ def get_app_tz():
         return ZoneInfo(APP_TIMEZONE)
     except Exception:
         return timezone.utc
-        
+
+
 def in_hourly_pause_window():
     now = datetime.now(get_app_tz())
     minute = now.minute
@@ -475,6 +480,35 @@ def get_dataset_for_key_uncached(product, key):
         "cacheHit": False,
         "io": ds,
     }
+
+
+def get_cached_dataset_for_exact_hour(target_dt_utc, latest_meta=None):
+    target_dt_utc = floor_to_hour_utc(target_dt_utc)
+
+    if latest_meta:
+        try:
+            latest_dt = floor_to_hour_utc(parse_iso_utc(latest_meta["fileTimestampUtc"]))
+            if latest_dt == target_dt_utc:
+                return latest_meta
+        except Exception:
+            pass
+
+    product, key, checked = pick_best_key_for_hour(target_dt_utc)
+    if not product or not key:
+        return None
+
+    prepare_cache_for_key(key, product)
+    with CACHE_LOCK:
+        return {
+            "selectedProduct": CACHE.get("selectedProduct"),
+            "selectedKey": CACHE.get("selectedKey"),
+            "fileTimestampUtc": CACHE.get("fileTimestampUtc"),
+            "variableName": CACHE.get("variableName"),
+            "dataArray": CACHE.get("dataArray"),
+            "cacheHit": bool(CACHE.get("cacheHit")),
+            "io": None,
+            "checkedProducts": checked,
+        }
 
 
 def sample_nearest_with_grid(da, lat, lon):
@@ -1007,6 +1041,49 @@ def build_incremental_rollups(existing_parent, new_history_entry, previous_hour_
     return last24, daily30
 
 
+def get_parent_latest_file_timestamp(existing_parent):
+    if not isinstance(existing_parent, dict):
+        return None
+
+    history_meta = existing_parent.get("mrmsHistoryMeta") or {}
+    current_ts = str(history_meta.get("latestFileTimestampUtc") or "").strip()
+    if current_ts:
+        return current_ts
+
+    latest = existing_parent.get("mrmsHourlyLatest") or {}
+    current_ts = str(latest.get("fileTimestampUtc") or "").strip()
+    if current_ts:
+        return current_ts
+
+    return None
+
+
+def get_next_needed_hour_for_field(existing_parent, latest_available_hour_utc=None):
+    current_ts = get_parent_latest_file_timestamp(existing_parent)
+
+    if current_ts:
+        current_dt = floor_to_hour_utc(parse_iso_utc(current_ts))
+        return {
+            "targetHourUtc": iso_utc(current_dt + timedelta(hours=1)),
+            "reason": "next_after_saved_hour",
+            "currentLatestHourUtc": iso_utc(current_dt),
+        }
+
+    if latest_available_hour_utc:
+        latest_dt = floor_to_hour_utc(parse_iso_utc(latest_available_hour_utc))
+        return {
+            "targetHourUtc": iso_utc(latest_dt),
+            "reason": "seed_with_latest_available",
+            "currentLatestHourUtc": None,
+        }
+
+    return {
+        "targetHourUtc": None,
+        "reason": "no_known_target",
+        "currentLatestHourUtc": None,
+    }
+
+
 def maybe_prune_old_hourly_docs(field_id, anchor_hour_utc):
     db = get_db()
     parent_ref = db.collection(MRMS_PARENT_COLLECTION).document(field_id)
@@ -1104,6 +1181,7 @@ def rebuild_last24_and_daily30(field_id):
 
     return last24, daily30
 
+
 def should_skip_normal_write(existing_parent, incoming_file_timestamp_utc):
     try:
         if not incoming_file_timestamp_utc:
@@ -1140,7 +1218,6 @@ def should_skip_normal_write(existing_parent, incoming_file_timestamp_utc):
         return False
 
 
-
 def write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, result):
     history_entry = build_hour_history_entry(meta, mode, radius_miles, result)
 
@@ -1157,9 +1234,6 @@ def write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, resu
     history_meta = existing_parent.get("mrmsHistoryMeta") or {}
     existing_daily30 = existing_parent.get("mrmsDailySeries30d") or []
 
-    # IMPORTANT:
-    # If this field is not fully backfilled yet, or the parent daily rollup is still thin/empty,
-    # do NOT trust incremental rollups. Rebuild from hourly docs so daily totals stay correct.
     needs_rebuild = (
         not bool(history_meta.get("fullBackfillComplete", False))
         or not isinstance(existing_daily30, list)
@@ -1670,7 +1744,6 @@ def find_missing_recent_hours(field_id, latest_hour_utc, lookback_hours):
 def maybe_auto_enqueue_gap_repair(field, mode, radius_miles, latest_hour_utc):
     state = get_field_mrms_state(field["id"])
 
-    # 🚫 HARD STOP: never repair until full backfill is complete
     if not state.get("fullBackfillComplete"):
         return {
             "fieldId": field["id"],
@@ -1714,11 +1787,14 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
     if radius_miles <= 0:
         raise RuntimeError("radiusMiles must be > 0")
 
-    meta = get_cached_dataset()
-    da = meta["dataArray"]
+    latest_meta = get_cached_dataset()
+    latest_available_hour_utc = latest_meta["fileTimestampUtc"]
+    latest_available_dt = floor_to_hour_utc(parse_iso_utc(latest_available_hour_utc))
 
     ok = 0
     skipped_stale = 0
+    skipped_up_to_date = 0
+    skipped_missing_exact_hour = 0
     fail = 0
     failures = []
     auto_enqueued_backfills = 0
@@ -1753,23 +1829,38 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
             existing_parent_snap = parent_ref.get()
             existing_parent = existing_parent_snap.to_dict() or {}
 
-            if (
-                not location_changed_this_run
-                and should_skip_normal_write(existing_parent, meta["fileTimestampUtc"])
-            ):
+            target_info = get_next_needed_hour_for_field(
+                existing_parent=existing_parent,
+                latest_available_hour_utc=latest_available_hour_utc,
+            )
+            target_hour_utc = target_info.get("targetHourUtc")
+
+            if not target_hour_utc:
                 print(
-                    f"[MRMS Stale Skip] fieldId={field['id']} fieldName={field.get('name')} "
-                    f"incoming={meta['fileTimestampUtc']}",
+                    f"[MRMS Hourly No Target] fieldId={field['id']} fieldName={field.get('name')} "
+                    f"reason={target_info.get('reason')}",
                     flush=True
                 )
-                skipped_stale += 1
+                skipped_missing_exact_hour += 1
+                continue
+
+            target_dt = floor_to_hour_utc(parse_iso_utc(target_hour_utc))
+
+            if target_dt > latest_available_dt:
+                print(
+                    f"[MRMS Hourly Up To Date] fieldId={field['id']} fieldName={field.get('name')} "
+                    f"current={target_info.get('currentLatestHourUtc')} "
+                    f"nextNeeded={target_hour_utc} latestAvailable={latest_available_hour_utc}",
+                    flush=True
+                )
+                skipped_up_to_date += 1
 
                 try:
                     auto_rep = maybe_auto_enqueue_gap_repair(
                         field=field,
                         mode=mode,
                         radius_miles=radius_miles,
-                        latest_hour_utc=meta["fileTimestampUtc"],
+                        latest_hour_utc=latest_available_hour_utc,
                     )
                     if auto_rep.get("queued"):
                         auto_enqueued_repairs += 1
@@ -1779,6 +1870,59 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
 
                 continue
 
+            meta = get_cached_dataset_for_exact_hour(target_dt, latest_meta=latest_meta)
+
+            if not meta:
+                print(
+                    f"[MRMS Hourly Exact Hour Missing] fieldId={field['id']} fieldName={field.get('name')} "
+                    f"target={target_hour_utc} latestAvailable={latest_available_hour_utc}",
+                    flush=True
+                )
+                skipped_missing_exact_hour += 1
+
+                try:
+                    auto_rep = maybe_auto_enqueue_gap_repair(
+                        field=field,
+                        mode=mode,
+                        radius_miles=radius_miles,
+                        latest_hour_utc=latest_available_hour_utc,
+                    )
+                    if auto_rep.get("queued"):
+                        auto_enqueued_repairs += 1
+                except Exception as e:
+                    auto_enqueue_repair_failures += 1
+                    print(f"[AutoEnqueueRepair] failed for {field['id']}: {e}", flush=True)
+
+                continue
+
+            if (
+                not location_changed_this_run
+                and should_skip_normal_write(existing_parent, meta["fileTimestampUtc"])
+            ):
+                print(
+                    f"[MRMS Stale Skip] fieldId={field['id']} fieldName={field.get('name')} "
+                    f"incoming={meta['fileTimestampUtc']} current={target_info.get('currentLatestHourUtc')} "
+                    f"target={target_hour_utc}",
+                    flush=True
+                )
+                skipped_stale += 1
+
+                try:
+                    auto_rep = maybe_auto_enqueue_gap_repair(
+                        field=field,
+                        mode=mode,
+                        radius_miles=radius_miles,
+                        latest_hour_utc=latest_available_hour_utc,
+                    )
+                    if auto_rep.get("queued"):
+                        auto_enqueued_repairs += 1
+                except Exception as e:
+                    auto_enqueue_repair_failures += 1
+                    print(f"[AutoEnqueueRepair] failed for {field['id']}: {e}", flush=True)
+
+                continue
+
+            da = meta["dataArray"]
             result = (
                 build_single_result(da, field["lat"], field["lng"])
                 if mode == "single"
@@ -1790,19 +1934,18 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
             write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, result)
             ok += 1
 
-            if not location_changed_this_run:
-                try:
-                    auto_rep = maybe_auto_enqueue_gap_repair(
-                        field=field,
-                        mode=mode,
-                        radius_miles=radius_miles,
-                        latest_hour_utc=meta["fileTimestampUtc"],
-                    )
-                    if auto_rep.get("queued"):
-                        auto_enqueued_repairs += 1
-                except Exception as e:
-                    auto_enqueue_repair_failures += 1
-                    print(f"[AutoEnqueueRepair] failed for {field['id']}: {e}", flush=True)
+            try:
+                auto_rep = maybe_auto_enqueue_gap_repair(
+                    field=field,
+                    mode=mode,
+                    radius_miles=radius_miles,
+                    latest_hour_utc=latest_available_hour_utc,
+                )
+                if auto_rep.get("queued"):
+                    auto_enqueued_repairs += 1
+            except Exception as e:
+                auto_enqueue_repair_failures += 1
+                print(f"[AutoEnqueueRepair] failed for {field['id']}: {e}", flush=True)
 
         except Exception as e:
             fail += 1
@@ -1816,12 +1959,14 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
         "total": total,
         "ok": ok,
         "skippedStaleOrDuplicateLatest": skipped_stale,
+        "skippedUpToDateNoNewHour": skipped_up_to_date,
+        "skippedMissingExactHour": skipped_missing_exact_hour,
         "fail": fail,
         "collection": MRMS_PARENT_COLLECTION,
-        "selectedProduct": meta["selectedProduct"],
-        "selectedKey": meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
-        "fileTimestampUtc": meta["fileTimestampUtc"],
-        "cacheHit": meta["cacheHit"],
+        "selectedProduct": latest_meta["selectedProduct"],
+        "selectedKey": latest_meta["selectedKey"].replace(f"{AWS_BUCKET}/", ""),
+        "fileTimestampUtc": latest_meta["fileTimestampUtc"],
+        "cacheHit": latest_meta["cacheHit"],
         "autoLocationResets": auto_location_resets,
         "autoLocationResetFailures": auto_location_reset_failures,
         "autoEnqueuedBackfills": auto_enqueued_backfills,
@@ -2408,7 +2553,8 @@ def root():
         "rainUnit": "mm",
         "notes": {
             "normalWrites": "incremental parent updates (no full history reread)",
-            "fullRebuilds": "used for finalize/backfill/repair completion only"
+            "fullRebuilds": "used for finalize/backfill/repair completion only",
+            "hourlyTargeting": "writes next needed hour per field, not global latest for every field"
         },
         "routes": {
             "single": "/api/mrms-1h?lat=39.7898&lon=-91.2059",
@@ -2634,6 +2780,7 @@ def repair_field_route():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
 
+
 @app.get("/enqueue-repair-all")
 def enqueue_repair_all_route():
     try:
@@ -2691,7 +2838,6 @@ def process_next_repair_route():
 @app.get("/process-repair-batch")
 def process_repair_batch_route():
     try:
-        # ⛔ PAUSE WINDOW (prevents collision with hourly)
         if in_hourly_pause_window():
             return jsonify({
                 "ok": True,

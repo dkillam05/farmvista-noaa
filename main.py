@@ -295,18 +295,48 @@ def list_key_for_exact_hour(region, product, target_dt_utc):
 def pick_best_key_for_latest():
     now_utc = datetime.now(timezone.utc)
     checked = []
+    candidates = []
 
     for product in PRODUCT_PRIORITY:
         key = list_latest_key(DEFAULT_REGION, product, now_utc)
+
+        parsed_ts = None
+        try:
+            parsed_ts = parse_timestamp_from_key(key) if key else None
+        except Exception:
+            parsed_ts = None
+
         checked.append({
             "product": product,
             "found": bool(key),
             "selectedKey": key.replace(f"{AWS_BUCKET}/", "") if key else None,
+            "parsedTimestampUtc": iso_utc(parsed_ts) if parsed_ts else None,
         })
-        if key:
-            return product, key, checked
 
-    return None, None, checked
+        if key and parsed_ts:
+            candidates.append({
+                "product": product,
+                "key": key,
+                "ts": parsed_ts,
+            })
+
+    if not candidates:
+        return None, None, checked
+
+    # Newest timestamp wins.
+    # If timestamps tie, keep PRODUCT_PRIORITY order (Pass2 before Pass1).
+    priority_rank = {name: idx for idx, name in enumerate(PRODUCT_PRIORITY)}
+    candidates.sort(key=lambda x: (x["ts"], -priority_rank.get(x["product"], 999)))
+    winner = candidates[-1]
+
+    print(
+        f"[MRMS Latest Winner] product={winner['product']} "
+        f"fileTimestampUtc={iso_utc(winner['ts'])} "
+        f"selectedKey={winner['key'].replace(f'{AWS_BUCKET}/', '')}",
+        flush=True
+    )
+
+    return winner["product"], winner["key"], checked
 
 
 def pick_best_key_for_hour(target_dt_utc):

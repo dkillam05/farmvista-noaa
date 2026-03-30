@@ -1,7 +1,7 @@
 # =====================================================================
 # main.py  (FULL FILE)
 # FarmVista NOAA MRMS Pass2->Pass1 fallback rainfall service
-# Rev: 2026-03-30a-hourly-sequential-next-hour-fix
+# Rev: 2026-03-30b-hourly-authoritative-subcollection-fix
 #
 # PURPOSE
 # ✅ Pulls MRMS hourly rainfall from NOAA AWS
@@ -19,10 +19,9 @@
 # ✅ FIX: full rebuild path is preserved for full backfill / repair completion only
 # ✅ FIX: restore robust longitude/grid sampling logic from prior working version
 # ✅ FIX: normal writes skip duplicate/stale latest hour for each field
-# ✅ NEW: hourly run now writes the NEXT needed hour per field instead of blindly
-#         using the same global "latest available" hour for every field
-# ✅ NEW: prevents stale-skip spam caused by fields already being ahead of the
-#         current NOAA "latest available" file selected at run time
+# ✅ FIX: hourly next-needed targeting now trusts actual hourly subcollection first,
+#         not just the parent doc latest timestamp
+# ✅ FIX: prevents false "up to date" when parent doc got ahead of saved hourly docs
 #
 # NOTES
 # - This file keeps the original route/helper structure.
@@ -183,8 +182,6 @@ def get_app_tz():
 def in_hourly_pause_window():
     now = datetime.now(get_app_tz())
     minute = now.minute
-
-    # Pause repair from :18 to :24 every hour
     return 18 <= minute <= 24
 
 
@@ -323,8 +320,6 @@ def pick_best_key_for_latest():
     if not candidates:
         return None, None, checked
 
-    # Newest timestamp wins.
-    # If timestamps tie, keep PRODUCT_PRIORITY order (Pass2 before Pass1).
     priority_rank = {name: idx for idx, name in enumerate(PRODUCT_PRIORITY)}
     candidates.sort(key=lambda x: (x["ts"], -priority_rank.get(x["product"], 999)))
     winner = candidates[-1]
@@ -476,7 +471,6 @@ def prepare_cache_for_key(key, product):
 
 
 def get_cached_dataset():
-    now_utc = datetime.now(timezone.utc)
     product, key, checked = pick_best_key_for_latest()
     if not product or not key:
         raise RuntimeError("Could not find recent MRMS data from Pass2 or Pass1.")
@@ -1088,15 +1082,58 @@ def get_parent_latest_file_timestamp(existing_parent):
     return None
 
 
-def get_next_needed_hour_for_field(existing_parent, latest_available_hour_utc=None):
-    current_ts = get_parent_latest_file_timestamp(existing_parent)
+def get_authoritative_latest_saved_hour(field_id, existing_parent=None):
+    db = get_db()
+    parent_latest_ts = get_parent_latest_file_timestamp(existing_parent or {})
+    hourly_latest_ts = None
 
-    if current_ts:
-        current_dt = floor_to_hour_utc(parse_iso_utc(current_ts))
+    try:
+        latest_docs = list(
+            db.collection(MRMS_PARENT_COLLECTION)
+            .document(field_id)
+            .collection(MRMS_HOURLY_SUBCOLLECTION)
+            .order_by("fileTimestampUtc", direction=firestore.Query.DESCENDING)
+            .limit(1)
+            .stream()
+        )
+        if latest_docs:
+            latest_doc = latest_docs[0].to_dict() or {}
+            hourly_latest_ts = str(latest_doc.get("fileTimestampUtc") or "").strip() or None
+    except Exception as e:
+        print(f"[MRMS Latest Hour Lookup] fieldId={field_id} error={e}", flush=True)
+
+    authoritative_ts = hourly_latest_ts or parent_latest_ts
+
+    source = "none"
+    if hourly_latest_ts:
+        source = "hourly_subcollection"
+    elif parent_latest_ts:
+        source = "parent_fallback"
+
+    return {
+        "authoritativeLatestHourUtc": authoritative_ts,
+        "hourlyLatestHourUtc": hourly_latest_ts,
+        "parentLatestHourUtc": parent_latest_ts,
+        "source": source,
+    }
+
+
+def get_next_needed_hour_for_field(field_id, existing_parent, latest_available_hour_utc=None):
+    latest_info = get_authoritative_latest_saved_hour(
+        field_id=field_id,
+        existing_parent=existing_parent,
+    )
+    authoritative_ts = latest_info.get("authoritativeLatestHourUtc")
+
+    if authoritative_ts:
+        current_dt = floor_to_hour_utc(parse_iso_utc(authoritative_ts))
         return {
             "targetHourUtc": iso_utc(current_dt + timedelta(hours=1)),
-            "reason": "next_after_saved_hour",
+            "reason": "next_after_authoritative_saved_hour",
             "currentLatestHourUtc": iso_utc(current_dt),
+            "currentLatestHourSource": latest_info.get("source"),
+            "hourlyLatestHourUtc": latest_info.get("hourlyLatestHourUtc"),
+            "parentLatestHourUtc": latest_info.get("parentLatestHourUtc"),
         }
 
     if latest_available_hour_utc:
@@ -1105,12 +1142,18 @@ def get_next_needed_hour_for_field(existing_parent, latest_available_hour_utc=No
             "targetHourUtc": iso_utc(latest_dt),
             "reason": "seed_with_latest_available",
             "currentLatestHourUtc": None,
+            "currentLatestHourSource": "none",
+            "hourlyLatestHourUtc": None,
+            "parentLatestHourUtc": latest_info.get("parentLatestHourUtc"),
         }
 
     return {
         "targetHourUtc": None,
         "reason": "no_known_target",
         "currentLatestHourUtc": None,
+        "currentLatestHourSource": "none",
+        "hourlyLatestHourUtc": latest_info.get("hourlyLatestHourUtc"),
+        "parentLatestHourUtc": latest_info.get("parentLatestHourUtc"),
     }
 
 
@@ -1231,9 +1274,6 @@ def should_skip_normal_write(existing_parent, incoming_file_timestamp_utc):
 
         current_dt = parse_iso_utc(current_ts)
 
-        # Only skip when incoming data is truly OLDER than what we already have.
-        # If NOAA repeats the same hour/timestamp, allow overwrite/refresh so hourly
-        # does not silently stop updating.
         if incoming_dt < current_dt:
             return True
 
@@ -1860,6 +1900,7 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
             existing_parent = existing_parent_snap.to_dict() or {}
 
             target_info = get_next_needed_hour_for_field(
+                field_id=field["id"],
                 existing_parent=existing_parent,
                 latest_available_hour_utc=latest_available_hour_utc,
             )
@@ -1880,6 +1921,9 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
                 print(
                     f"[MRMS Hourly Up To Date] fieldId={field['id']} fieldName={field.get('name')} "
                     f"current={target_info.get('currentLatestHourUtc')} "
+                    f"currentSource={target_info.get('currentLatestHourSource')} "
+                    f"hourlyLatest={target_info.get('hourlyLatestHourUtc')} "
+                    f"parentLatest={target_info.get('parentLatestHourUtc')} "
                     f"nextNeeded={target_hour_utc} latestAvailable={latest_available_hour_utc}",
                     flush=True
                 )
@@ -1905,7 +1949,10 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
             if not meta:
                 print(
                     f"[MRMS Hourly Exact Hour Missing] fieldId={field['id']} fieldName={field.get('name')} "
-                    f"target={target_hour_utc} latestAvailable={latest_available_hour_utc}",
+                    f"target={target_hour_utc} latestAvailable={latest_available_hour_utc} "
+                    f"currentSource={target_info.get('currentLatestHourSource')} "
+                    f"hourlyLatest={target_info.get('hourlyLatestHourUtc')} "
+                    f"parentLatest={target_info.get('parentLatestHourUtc')}",
                     flush=True
                 )
                 skipped_missing_exact_hour += 1
@@ -1932,6 +1979,9 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
                 print(
                     f"[MRMS Stale Skip] fieldId={field['id']} fieldName={field.get('name')} "
                     f"incoming={meta['fileTimestampUtc']} current={target_info.get('currentLatestHourUtc')} "
+                    f"currentSource={target_info.get('currentLatestHourSource')} "
+                    f"hourlyLatest={target_info.get('hourlyLatestHourUtc')} "
+                    f"parentLatest={target_info.get('parentLatestHourUtc')} "
                     f"target={target_hour_utc}",
                     flush=True
                 )
@@ -2584,7 +2634,7 @@ def root():
         "notes": {
             "normalWrites": "incremental parent updates (no full history reread)",
             "fullRebuilds": "used for finalize/backfill/repair completion only",
-            "hourlyTargeting": "writes next needed hour per field, not global latest for every field"
+            "hourlyTargeting": "writes next needed hour per field using authoritative latest saved hourly doc first"
         },
         "routes": {
             "single": "/api/mrms-1h?lat=39.7898&lon=-91.2059",
@@ -2996,10 +3046,6 @@ def queue_simple():
             "error": str(e)
         }), 500
 
-
-# ---------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "8080"))

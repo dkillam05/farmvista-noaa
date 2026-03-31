@@ -1944,7 +1944,7 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
 
                 continue
 
-             meta = get_cached_dataset_for_exact_hour(target_dt, latest_meta=latest_meta)
+            meta = get_cached_dataset_for_exact_hour(target_dt, latest_meta=latest_meta)
 
             if not meta:
                 print(

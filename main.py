@@ -254,13 +254,9 @@ def list_latest_key(region, product, now_utc, max_age_hours=12):
         grib_keys.sort()
         return grib_keys[-1]
 
-    recent = []
-    for ts, k in dated:
-        age_hours = abs((now_utc - ts).total_seconds()) / 3600.0
-        if age_hours <= max_age_hours:
-            recent.append((ts, k))
-
-    pool = recent if recent else dated
+    dated.sort(key=lambda x: x[0])
+    return dated[-1][1]
+    
     pool.sort(key=lambda x: x[0])
     return pool[-1][1]
 

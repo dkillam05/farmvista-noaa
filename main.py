@@ -1946,31 +1946,15 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
 
             meta = get_cached_dataset_for_exact_hour(target_dt, latest_meta=latest_meta)
 
-            if not meta:
-                print(
-                    f"[MRMS Hourly Exact Hour Missing] fieldId={field['id']} fieldName={field.get('name')} "
-                    f"target={target_hour_utc} latestAvailable={latest_available_hour_utc} "
-                    f"currentSource={target_info.get('currentLatestHourSource')} "
-                    f"hourlyLatest={target_info.get('hourlyLatestHourUtc')} "
-                    f"parentLatest={target_info.get('parentLatestHourUtc')}",
-                    flush=True
-                )
-                skipped_missing_exact_hour += 1
+         if not meta:
+    print(
+        f"[MRMS Hourly Exact Hour Missing → FALLBACK TO LATEST] fieldId={field['id']} "
+        f"target={target_hour_utc} usingLatest={latest_available_hour_utc}",
+        flush=True
+    )
 
-                try:
-                    auto_rep = maybe_auto_enqueue_gap_repair(
-                        field=field,
-                        mode=mode,
-                        radius_miles=radius_miles,
-                        latest_hour_utc=latest_available_hour_utc,
-                    )
-                    if auto_rep.get("queued"):
-                        auto_enqueued_repairs += 1
-                except Exception as e:
-                    auto_enqueue_repair_failures += 1
-                    print(f"[AutoEnqueueRepair] failed for {field['id']}: {e}", flush=True)
-
-                continue
+    # 🔥 fallback to latest instead of stalling
+    meta = latest_meta
 
             if (
                 not location_changed_this_run

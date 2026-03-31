@@ -27,7 +27,7 @@
 # - This file keeps the original route/helper structure.
 # - This file handles MRMS automation only.
 # - Weather-cache automation is still handled elsewhere.
-# - Backfill jobs always read the current field lat/lng from Firestore.
+# - Backfill jobs always read the current field lat/lng from Firestore
 # =====================================================================
 
 import gzip

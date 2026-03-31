@@ -155,7 +155,12 @@ def ensure_runtime_ready():
 
 def get_fs():
     ensure_runtime_ready()
-    return fsspec.filesystem("s3", anon=True)
+    return fsspec.filesystem(
+        "s3",
+        anon=True,
+        skip_instance_cache=True,
+        use_listings_cache=False,
+    )
 
 
 def get_db():
@@ -256,9 +261,6 @@ def list_latest_key(region, product, now_utc, max_age_hours=12):
 
     dated.sort(key=lambda x: x[0])
     return dated[-1][1]
-    
-    pool.sort(key=lambda x: x[0])
-    return pool[-1][1]
 
 
 def list_key_for_exact_hour(region, product, target_dt_utc):

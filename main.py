@@ -440,10 +440,6 @@ def to_signed_lon(lon):
 
 def prepare_cache_for_key(key, product):
     ts = parse_timestamp_from_key(key)
-    with CACHE_LOCK:
-        if CACHE.get("selectedKey") == key and CACHE.get("dataArray") is not None:
-            CACHE["cacheHit"] = True
-            return
 
     ds = load_dataset_for_key(key)
     da_raw, variable_name = get_data_var(ds)

@@ -1944,17 +1944,17 @@ def run_batch_cache(mode="weighted", radius_miles=DEFAULT_RADIUS_MILES):
 
                 continue
 
-            meta = get_cached_dataset_for_exact_hour(target_dt, latest_meta=latest_meta)
+             meta = get_cached_dataset_for_exact_hour(target_dt, latest_meta=latest_meta)
 
-         if not meta:
-    print(
-        f"[MRMS Hourly Exact Hour Missing → FALLBACK TO LATEST] fieldId={field['id']} "
-        f"target={target_hour_utc} usingLatest={latest_available_hour_utc}",
-        flush=True
-    )
+            if not meta:
+                print(
+                    f"[MRMS Hourly Exact Hour Missing → FALLBACK TO LATEST] fieldId={field['id']} "
+                    f"target={target_hour_utc} usingLatest={latest_available_hour_utc}",
+                    flush=True
+                )
 
-    # 🔥 fallback to latest instead of stalling
-    meta = latest_meta
+                # fallback to latest instead of stalling
+                meta = latest_meta
 
             if (
                 not location_changed_this_run

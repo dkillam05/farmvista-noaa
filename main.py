@@ -2854,7 +2854,37 @@ def enqueue_repair_all_route():
         return jsonify({"ok": True, **out})
     except Exception as e:
         return jsonify({"ok": False, "error": str(e), "trace": traceback.format_exc()}), 500
+@app.get("/rebuild-field-parent")
+def rebuild_field_parent_route():
+    try:
+        field_id = str(request.args.get("fieldId") or "").strip()
+        if not field_id:
+            return jsonify({
+                "ok": False,
+                "error": "Missing required query param: fieldId"
+            }), 400
 
+        mark_full_backfill_complete = str(
+            request.args.get("markFullBackfillComplete") or "false"
+        ).strip().lower() in {"1", "true", "yes", "y"}
+
+        out = finalize_field_parent_from_hourly(
+            field_id,
+            mark_full_backfill_complete=mark_full_backfill_complete,
+        )
+
+        return jsonify({
+            "ok": True,
+            "fieldId": field_id,
+            "rebuilt": True,
+            "result": out,
+        })
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+            "trace": traceback.format_exc(),
+        }), 500
 
 @app.get("/run-repair-all")
 def run_repair_all_route():

@@ -2886,6 +2886,72 @@ def rebuild_field_parent_route():
             "trace": traceback.format_exc(),
         }), 500
 
+@app.get("/rebuild-all-field-parents")
+def rebuild_all_field_parents_route():
+    try:
+        limit_raw = str(request.args.get("limit") or "").strip()
+        mark_full_backfill_complete = str(
+            request.args.get("markFullBackfillComplete") or "false"
+        ).strip().lower() in {"1", "true", "yes", "y"}
+
+        fields = load_active_fields_for_batch()
+
+        if limit_raw:
+            try:
+                limit_n = max(1, int(limit_raw))
+                fields = fields[:limit_n]
+            except Exception:
+                return jsonify({
+                    "ok": False,
+                    "error": f"Invalid limit: {limit_raw}"
+                }), 400
+
+        total = len(fields)
+        rebuilt = 0
+        failed = 0
+        failures = []
+
+        for field in fields:
+            try:
+                field_id = str(field.get("id") or "").strip()
+                if not field_id:
+                    failed += 1
+                    failures.append({
+                        "fieldId": None,
+                        "error": "Missing field id"
+                    })
+                    continue
+
+                finalize_field_parent_from_hourly(
+                    field_id,
+                    mark_full_backfill_complete=mark_full_backfill_complete,
+                )
+                rebuilt += 1
+
+            except Exception as e:
+                failed += 1
+                failures.append({
+                    "fieldId": str(field.get("id") or ""),
+                    "fieldName": field.get("name"),
+                    "error": str(e),
+                })
+
+        return jsonify({
+            "ok": True,
+            "totalActiveFields": total,
+            "rebuilt": rebuilt,
+            "failed": failed,
+            "failures": failures[:50],
+            "markFullBackfillComplete": mark_full_backfill_complete,
+        })
+
+    except Exception as e:
+        return jsonify({
+            "ok": False,
+            "error": str(e),
+            "trace": traceback.format_exc(),
+        }), 500
+
 @app.get("/run-repair-all")
 def run_repair_all_route():
     try:

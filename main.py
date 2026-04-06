@@ -1407,6 +1407,39 @@ def write_field_hour(parent_ref, hour_ref, field, meta, mode, radius_miles, resu
                 new_history_entry=history_entry,
                 previous_hour_entry=previous_hour_entry,
             )
+
+            touched_dates = set()
+            try:
+                new_row = normalize_hour_history_row(history_entry)
+                if new_row:
+                    new_dt = parse_iso_utc(new_row["fileTimestampUtc"])
+                    touched_dates.add(new_dt.astimezone(get_app_tz()).date().isoformat())
+            except Exception:
+                pass
+
+            try:
+                prev_row = normalize_hour_history_row(previous_hour_entry) if previous_hour_entry else None
+                if prev_row:
+                    prev_dt = parse_iso_utc(prev_row["fileTimestampUtc"])
+                    touched_dates.add(prev_dt.astimezone(get_app_tz()).date().isoformat())
+            except Exception:
+                pass
+
+            verify = verify_incremental_daily_buckets(
+                field_id=field["id"],
+                daily30=daily30,
+                touched_date_isos=list(touched_dates),
+            )
+
+            if not verify.get("ok"):
+                print(
+                    f"[MRMS Incremental Verify Fallback] field={field['id']} "
+                    f"mismatches={verify.get('mismatches')}",
+                    flush=True
+                )
+                last24, daily30 = rebuild_last24_and_daily30(field["id"])
+                rollup_mode = "full_rebuild_verify_fallback"
+
         except Exception as e:
             print(f"[MRMS Incremental Rollup Fallback] field={field['id']} error={e}", flush=True)
             last24, daily30 = rebuild_last24_and_daily30(field["id"])

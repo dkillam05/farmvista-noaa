@@ -959,6 +959,98 @@ def normalize_hour_history_row(row, fallback_hour_key=None):
         "mode": row.get("mode"),
         "source": row.get("source"),
     }
+    
+    def verify_incremental_daily_buckets(field_id, daily30, touched_date_isos):
+    db = get_db()
+    tz = get_app_tz()
+
+    touched = [str(x).strip() for x in (touched_date_isos or []) if str(x).strip()]
+    if not touched:
+        return {"ok": True, "reason": "no_touched_dates"}
+
+    touched_set = set(touched)
+
+    parent_ref = db.collection(MRMS_PARENT_COLLECTION).document(field_id)
+    hourly_ref = parent_ref.collection(MRMS_HOURLY_SUBCOLLECTION)
+
+    now_local = datetime.now(timezone.utc).astimezone(tz).date()
+    min_date = min(datetime.fromisoformat(d).date() for d in touched_set)
+    max_date = max(datetime.fromisoformat(d).date() for d in touched_set)
+
+    query_start_local = min_date
+    query_end_local = max_date + timedelta(days=1)
+
+    query_start_utc = datetime.combine(query_start_local, datetime.min.time(), tzinfo=tz).astimezone(timezone.utc)
+    query_end_utc = datetime.combine(query_end_local, datetime.min.time(), tzinfo=tz).astimezone(timezone.utc)
+
+    docs = list(
+        hourly_ref.where("fileTimestampUtc", ">=", iso_utc(query_start_utc))
+        .where("fileTimestampUtc", "<", iso_utc(query_end_utc))
+        .stream()
+    )
+
+    actual_map = {}
+    for doc in docs:
+        d = doc.to_dict() or {}
+        norm = normalize_hour_history_row(d, fallback_hour_key=doc.id)
+        if not norm:
+            continue
+
+        try:
+            dt = parse_iso_utc(norm["fileTimestampUtc"])
+            local_date = dt.astimezone(tz).date().isoformat()
+        except Exception:
+            continue
+
+        if local_date not in touched_set:
+            continue
+
+        bucket = actual_map.get(local_date)
+        if bucket is None:
+            bucket = {"rainMm": 0.0, "hoursCount": 0}
+            actual_map[local_date] = bucket
+
+        bucket["rainMm"] = round_num((num(bucket.get("rainMm")) or 0.0) + (num(norm.get("rainMm")) or 0.0), 4)
+        bucket["hoursCount"] = int(num(bucket.get("hoursCount")) or 0) + 1
+
+    parent_map = {}
+    for row in (daily30 or []):
+        if not isinstance(row, dict):
+            continue
+        date_iso = str(row.get("dateISO") or "").strip()
+        if not date_iso:
+            continue
+        if date_iso not in touched_set:
+            continue
+        parent_map[date_iso] = {
+            "rainMm": round_num(num(row.get("rainMm")) or 0.0, 4),
+            "hoursCount": int(num(row.get("hoursCount")) or 0),
+        }
+
+    mismatches = []
+    for date_iso in sorted(touched_set):
+        actual = actual_map.get(date_iso, {"rainMm": 0.0, "hoursCount": 0})
+        parent = parent_map.get(date_iso, {"rainMm": 0.0, "hoursCount": 0})
+
+        actual_rain = round_num(num(actual.get("rainMm")) or 0.0, 4)
+        parent_rain = round_num(num(parent.get("rainMm")) or 0.0, 4)
+        actual_hours = int(num(actual.get("hoursCount")) or 0)
+        parent_hours = int(num(parent.get("hoursCount")) or 0)
+
+        if actual_hours != parent_hours or abs(actual_rain - parent_rain) > 0.0001:
+            mismatches.append({
+                "dateISO": date_iso,
+                "actualRainMm": actual_rain,
+                "parentRainMm": parent_rain,
+                "actualHoursCount": actual_hours,
+                "parentHoursCount": parent_hours,
+            })
+
+    return {
+        "ok": len(mismatches) == 0,
+        "checkedDates": sorted(touched_set),
+        "mismatches": mismatches,
+    }
 
 
 def trim_daily30_map(daily_map, anchor_dt_utc):
